@@ -18,13 +18,20 @@ zero means "empty" and no separate occupancy bitmap is needed.
 from mm_string_dict import StringDict
 
 var counts = StringDict[Int]()
-counts.put("apple", 1)
-counts.put("pear", 2)
+counts["apple"] = 1
+counts["pear"] = 2
 
-print(counts.get("apple", 0))   # 1
+print(counts["apple"])          # 1, raises if absent
+print(counts.get("plum", 0))    # 0, the default
 print("pear" in counts)         # True
 print(len(counts))              # 2
+
+for entry in counts.items():
+    print(entry.key, entry.value)
 ```
+
+The surface mirrors the stdlib `Dict` where it can, so swapping one for the
+other is mostly mechanical.
 
 ## Install
 
@@ -72,13 +79,21 @@ StringDict[Int, DType.uint32, DType.uint32, True, False]  # don't cache hashes
 
 | Member | Meaning |
 | --- | --- |
-| `put(key, value)` | Insert, or replace the value if the key is there. |
+| `dict[key]` | The value, raising if the key is absent or deleted. |
+| `dict[key] = value` | Insert, or replace the value if the key is there. |
 | `get(key, default) -> V` | The value, or `default` when absent or deleted. |
-| `key in dict`, `len(dict)` | Membership, entry count. |
-| `delete(key)` | Tombstone an entry, if `destructive`. |
+| `key in dict`, `len(dict)`, `Bool(dict)` | Membership, entry count, emptiness. |
+| `pop(key) -> V` | Remove and return, raising if absent. |
+| `pop(key, default) -> V` | Remove and return, or `default`. |
+| `setdefault(key, default) -> V` | The value, inserting `default` first if absent. |
+| `update(other)` | Insert every live entry of `other`, replacing collisions. |
+| `keys()`, `values()`, `items()`, `for key in dict` | Iterate live entries in insertion order. `values()` yields references; `items()` yields `.key` and `.value`. |
 | `upsert(key, update)` | Insert or update with a function of the current value, looking the key up once. |
 | `clear()` | Drop every entry, keep the storage. |
-| `dict.keys` | The `KeysContainer`: `keys[i]`, `len`, `keys_vec()`, `print_keys()`. |
+| `key_bytes()`, `print_keys()` | Inspect the packed key buffer. |
+
+`put`, `get` and `delete` are the original names and still work; `__setitem__`,
+`__getitem__` and `pop` are the `Dict`-shaped spellings of the same operations.
 
 ## Performance
 
@@ -114,7 +129,7 @@ Caching hashes earns its keep:
 ## Development
 
 ```bash
-pixi run test     # the test suite (30 tests)
+pixi run test     # the test suite (42 tests)
 pixi run bench    # the benchmarks above
 pixi run main     # the example
 pixi run format   # mojo format
@@ -125,8 +140,9 @@ pixi build        # build the conda package (needs pixi >= 0.80)
 ## Provenance
 
 This is Maxim Zaks' `StringDict`, which also lives in the Mojo standard
-library's benchmark suite. Packaged here as a library, with tests, benchmarks
-and three bug fixes — see [`docs/fixes.md`](docs/fixes.md).
+library's benchmark suite. Packaged here as a library, with tests, benchmarks,
+a `Dict`-shaped API, and three bug fixes — see
+[`docs/fixes.md`](docs/fixes.md).
 
 ## License
 

@@ -37,10 +37,9 @@ handle.
 
 ## 4. Smaller items
 
-- **No iteration.** There is no way to walk the entries; `keys_vec()` returns
-  the keys, but nothing pairs them with values. An `items()` iterator yielding
-  `(StringSlice, ref V)` would be the natural addition, and would have to skip
-  tombstoned entries.
+- **`items()` copies the value**, though `values()` yields references. An
+  `Entry` holding a reference would need the caller to write `entry.value[]`,
+  which stops it reading like the stdlib `Dict`.
 - **`get` copies the value.** Returning a reference would avoid it for
   heap-owning value types, as `mm_fiby_tree`'s iterator now does, but it needs
   a sentinel story for the absent case — probably `Optional[ref]` or a

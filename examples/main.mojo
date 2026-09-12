@@ -20,7 +20,7 @@ def main() raises:
 
     # The keys live end to end in one buffer; here they are.
     print("\nkeys as stored:")
-    counts.keys.print_keys()
+    counts.print_keys()
 
     # Deleting tombstones an entry; putting it back revives it.
     counts.delete("the")

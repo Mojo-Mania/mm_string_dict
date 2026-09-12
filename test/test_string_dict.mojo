@@ -3,6 +3,7 @@ from std.testing import (
     TestSuite,
     assert_equal,
     assert_false,
+    assert_raises,
     assert_true,
 )
 
@@ -364,6 +365,155 @@ def test_random_operations_against_a_reference() raises:
             String("wrong value for ", entry.key),
         )
         assert_true(entry.key in dict)
+
+
+# ===-----------------------------------------------------------------------===#
+# The Dict-shaped surface
+# ===-----------------------------------------------------------------------===#
+
+
+def test_subscript_get_and_set() raises:
+    var dict = StringDict[Int]()
+    dict["apple"] = 1
+    dict["pear"] = 2
+    assert_equal(dict["apple"], 1)
+    assert_equal(dict["pear"], 2)
+    dict["apple"] = 9
+    assert_equal(dict["apple"], 9)
+    assert_equal(len(dict), 2)
+
+
+def test_subscript_raises_on_a_missing_key() raises:
+    var dict = StringDict[Int]()
+    dict["apple"] = 1
+    with assert_raises():
+        _ = dict["plum"]
+    dict.delete("apple")
+    with assert_raises():
+        _ = dict["apple"]
+
+
+def test_bool() raises:
+    var dict = StringDict[Int]()
+    assert_false(Bool(dict))
+    dict["apple"] = 1
+    assert_true(Bool(dict))
+    dict.delete("apple")
+    assert_false(Bool(dict))
+
+
+def test_keys_values_items() raises:
+    var dict = StringDict[Int]()
+    dict["apple"] = 1
+    dict["pear"] = 2
+    dict["plum"] = 3
+
+    var keys = List[String]()
+    for key in dict.keys():
+        keys.append(String(key))
+    assert_equal(len(keys), 3)
+    assert_equal(keys[0], "apple")
+    assert_equal(keys[2], "plum")
+
+    var total = 0
+    for value in dict.values():
+        total += value
+    assert_equal(total, 6)
+
+    var pairs = 0
+    for entry in dict.items():
+        pairs += 1
+        assert_equal(dict[entry.key], entry.value)
+    assert_equal(pairs, 3)
+
+
+def test_iteration_yields_keys() raises:
+    var dict = StringDict[Int]()
+    dict["apple"] = 1
+    dict["pear"] = 2
+    var seen = List[String]()
+    for key in dict:
+        seen.append(String(key))
+    assert_equal(len(seen), 2)
+    assert_equal(seen[0], "apple")
+
+
+def test_iteration_skips_deleted_entries() raises:
+    var dict = StringDict[Int]()
+    for i in range(10):
+        dict[String("key-", i)] = i
+    for i in range(0, 10, 2):
+        dict.delete(String("key-", i))
+    var seen = 0
+    var total = 0
+    for entry in dict.items():
+        seen += 1
+        total += entry.value
+    assert_equal(seen, 5)
+    assert_equal(total, 1 + 3 + 5 + 7 + 9)
+
+
+def test_iteration_over_an_empty_dict() raises:
+    var dict = StringDict[Int]()
+    var seen = 0
+    for _ in dict.keys():
+        seen += 1
+    assert_equal(seen, 0)
+
+
+def test_values_are_references() raises:
+    var dict = StringDict[String]()
+    dict["greeting"] = "hello"
+    for value in dict.values():
+        assert_equal(value, "hello")
+
+
+def test_pop() raises:
+    var dict = StringDict[Int]()
+    dict["apple"] = 1
+    dict["pear"] = 2
+    assert_equal(dict.pop("apple"), 1)
+    assert_equal(len(dict), 1)
+    assert_false("apple" in dict)
+    with assert_raises():
+        _ = dict.pop("apple")
+    assert_equal(dict.pop("nope", -1), -1)
+    assert_equal(dict.pop("pear", -1), 2)
+    assert_equal(len(dict), 0)
+
+
+def test_setdefault() raises:
+    var dict = StringDict[Int]()
+    assert_equal(dict.setdefault("apple", 1), 1)
+    assert_equal(dict.setdefault("apple", 99), 1, "must not overwrite")
+    assert_equal(len(dict), 1)
+    dict.delete("apple")
+    assert_equal(dict.setdefault("apple", 7), 7, "a deleted key is absent")
+    assert_equal(len(dict), 1)
+
+
+def test_update() raises:
+    var dict = StringDict[Int]()
+    dict["apple"] = 1
+    dict["pear"] = 2
+    var other = StringDict[Int]()
+    other["pear"] = 20
+    other["plum"] = 30
+    other["kiwi"] = 40
+    other.delete("kiwi")
+    dict.update(other)
+    assert_equal(len(dict), 3, "deleted entries are not carried over")
+    assert_equal(dict["apple"], 1)
+    assert_equal(dict["pear"], 20)
+    assert_equal(dict["plum"], 30)
+    assert_false("kiwi" in dict)
+
+
+def test_key_bytes_reports_the_packed_buffer() raises:
+    var dict = StringDict[Int]()
+    for i in range(100):
+        dict[String("key-", i)] = i
+    assert_true(dict.key_bytes() > 0)
 
 
 def main() raises:

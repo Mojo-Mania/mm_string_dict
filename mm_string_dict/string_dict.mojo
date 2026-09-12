@@ -249,7 +249,7 @@ struct StringDict[
     KeyOffsetType: DType = .uint32,
     destructive: Bool = True,
     caching_hashes: Bool = True,
-](Copyable, Movable, Sized):
+](Boolable, Copyable, Movable, Sized):
     """A hash map from string keys to `V`, with the keys packed end to end.
 
     Parameters:
@@ -266,11 +266,11 @@ struct StringDict[
             every probe, which is worth it unless keys are very short.
     """
 
-    var keys: KeysContainer[Self.KeyOffsetType]
-    """The keys, packed end to end."""
+    var _keys: KeysContainer[Self.KeyOffsetType]
+    """The keys, packed end to end. Reachable through `key_storage()`."""
     var key_hashes: Pointer[Scalar[Self.KeyCountType], MutUntrackedOrigin]
     """Cached hash per slot, when `caching_hashes` is on."""
-    var values: List[Self.V]
+    var _values: List[Self.V]
     """The values, in insertion order, parallel to the keys."""
     var slot_to_index: Pointer[Scalar[Self.KeyCountType], MutUntrackedOrigin]
     """One-based key index per slot; zero means the slot is empty."""
@@ -302,7 +302,7 @@ struct StringDict[
             self.capacity = capacity if pop_count(icapacity) == 1 else 1 << Int(
                 bit_width(icapacity)
             )
-        self.keys = KeysContainer[Self.KeyOffsetType](self.capacity)
+        self._keys = KeysContainer[Self.KeyOffsetType](self.capacity)
 
         comptime if Self.caching_hashes:
             self.key_hashes = alloc[Scalar[Self.KeyCountType]](
@@ -312,7 +312,7 @@ struct StringDict[
             self.key_hashes = alloc[Scalar[Self.KeyCountType]](
                 {count = 0}
             ).unsafe_leak()
-        self.values = List[Self.V](capacity=capacity)
+        self._values = List[Self.V](capacity=capacity)
         self.slot_to_index = alloc[Scalar[Self.KeyCountType]](
             {count = self.capacity}
         ).unsafe_leak()
@@ -334,7 +334,7 @@ struct StringDict[
         """
         self.count = copy.count
         self.capacity = copy.capacity
-        self.keys = copy.keys
+        self._keys = copy._keys
 
         comptime if Self.caching_hashes:
             self.key_hashes = alloc[Scalar[Self.KeyCountType]](
@@ -349,7 +349,7 @@ struct StringDict[
             self.key_hashes = alloc[Scalar[Self.KeyCountType]](
                 {count = 0}
             ).unsafe_leak()
-        self.values = copy.values.copy()
+        self._values = copy._values.copy()
         self.slot_to_index = alloc[Scalar[Self.KeyCountType]](
             {count = self.capacity}
         ).unsafe_leak()
@@ -377,9 +377,9 @@ struct StringDict[
         Args:
             move: The map to move from.
         """
-        self.keys = move.keys^
+        self._keys = move._keys^
         self.key_hashes = move.key_hashes
-        self.values = move.values^
+        self._values = move._values^
         self.slot_to_index = move.slot_to_index
         self.deleted_mask = move.deleted_mask
         self.count = move.count
@@ -444,6 +444,220 @@ struct StringDict[
                 return False
         return True
 
+    def key_bytes(self) -> Int:
+        """Returns how many bytes are allocated for the packed key buffer.
+
+        Returns:
+            The size of the key buffer, which holds every key's bytes end to
+            end -- live and deleted alike.
+        """
+        return self._keys.allocated_bytes
+
+    def print_keys(self):
+        """Prints every stored key, live or deleted, for debugging."""
+        self._keys.print_keys()
+
+    def __bool__(self) -> Bool:
+        """Returns whether the map holds any live entry.
+
+        Returns:
+            True if it is non-empty.
+        """
+        return self.count != 0
+
+    def __getitem__(self, key: StringSlice) raises -> Self.V:
+        """Returns the value for `key`, raising if it is not there.
+
+        Args:
+            key: The key to look up.
+
+        Raises:
+            Error: When the key is absent or deleted. Use `get` for a default.
+
+        Returns:
+            The stored value.
+        """
+        var key_index = self._find_key_index(key)
+        if key_index != 0:
+            comptime if Self.destructive:
+                if self._is_deleted(key_index - 1):
+                    raise Error("KeyError: ", key)
+            return self._values[key_index - 1].copy()
+        raise Error("KeyError: ", key)
+
+    def __setitem__(mut self, key: StringSlice, value: Self.V):
+        """Inserts `key`, or replaces the value if it is already present.
+
+        Args:
+            key: The key to insert. Its bytes are copied.
+            value: The value to associate with it.
+        """
+        self.put(key, value)
+
+    def setdefault(mut self, key: StringSlice, default: Self.V) -> Self.V:
+        """Returns the value for `key`, inserting `default` if it is absent.
+
+        Args:
+            key: The key to look up or insert.
+            default: The value to insert when the key is absent.
+
+        Returns:
+            The value the map holds for `key` afterwards.
+        """
+        var key_index = self._find_key_index(key)
+        if key_index != 0:
+            comptime if Self.destructive:
+                if not self._is_deleted(key_index - 1):
+                    return self._values[key_index - 1].copy()
+            else:
+                return self._values[key_index - 1].copy()
+        self.put(key, default)
+        return default.copy()
+
+    def pop(mut self, key: StringSlice) raises -> Self.V:
+        """Removes `key` and returns its value, raising if it is not there.
+
+        Args:
+            key: The key to remove.
+
+        Raises:
+            Error: When the key is absent, or when `destructive` is off and the
+                entry therefore cannot be removed.
+
+        Returns:
+            The value that was stored.
+        """
+        comptime if not Self.destructive:
+            raise Error(
+                "pop needs a destructive StringDict; this one cannot delete"
+            )
+        else:
+            var key_index = self._find_key_index(key)
+            if key_index == 0 or self._is_deleted(key_index - 1):
+                raise Error("KeyError: ", key)
+            var value = self._values[key_index - 1].copy()
+            self.count -= 1
+            self._deleted(key_index - 1)
+            return value^
+
+    def pop(mut self, key: StringSlice, default: Self.V) -> Self.V:
+        """Removes `key` and returns its value, or `default` if it is absent.
+
+        Args:
+            key: The key to remove.
+            default: What to return when the key is not there.
+
+        Returns:
+            The value that was stored, or `default`.
+        """
+        comptime if not Self.destructive:
+            return default.copy()
+        else:
+            var key_index = self._find_key_index(key)
+            if key_index == 0 or self._is_deleted(key_index - 1):
+                return default.copy()
+            var value = self._values[key_index - 1].copy()
+            self.count -= 1
+            self._deleted(key_index - 1)
+            return value^
+
+    def update(mut self, other: Self):
+        """Inserts every entry of `other`, replacing values that collide.
+
+        Args:
+            other: The map to copy entries from.
+        """
+        for index in range(other._keys.count):
+            comptime if Self.destructive:
+                if other._is_deleted(index):
+                    continue
+            self.put(other._keys[index], other._values[index])
+
+    def keys(
+        ref self,
+    ) -> _KeysIter[
+        Self.V,
+        Self.KeyCountType,
+        Self.KeyOffsetType,
+        Self.destructive,
+        Self.caching_hashes,
+        origin_of(self),
+    ]:
+        """Returns an iterator over the live keys, in insertion order.
+
+        Returns:
+            An iterator yielding slices of the key buffer.
+        """
+        return {src = Pointer(to=self)}
+
+    def values(
+        ref self,
+    ) -> _ValuesIter[
+        Self.V,
+        Self.KeyCountType,
+        Self.KeyOffsetType,
+        Self.destructive,
+        Self.caching_hashes,
+        origin_of(self),
+    ]:
+        """Returns an iterator over the live values, in insertion order.
+
+        Values are yielded by reference, so nothing is copied.
+
+        Returns:
+            An iterator yielding references to the values.
+        """
+        return {src = Pointer(to=self)}
+
+    def items(
+        ref self,
+    ) -> _ItemsIter[
+        Self.V,
+        Self.KeyCountType,
+        Self.KeyOffsetType,
+        Self.destructive,
+        Self.caching_hashes,
+        origin_of(self),
+    ]:
+        """Returns an iterator over the live entries, in insertion order.
+
+        Each entry carries a `key` slice and a copy of the `value`; use
+        `values()` when copying the value would be wasteful.
+
+        Returns:
+            An iterator yielding entries.
+        """
+        return {src = Pointer(to=self)}
+
+    def __iter__(
+        ref self,
+    ) -> _KeysIter[
+        Self.V,
+        Self.KeyCountType,
+        Self.KeyOffsetType,
+        Self.destructive,
+        Self.caching_hashes,
+        origin_of(self),
+    ]:
+        """Returns an iterator over the live keys, like the stdlib `Dict`.
+
+        Returns:
+            An iterator yielding slices of the key buffer.
+        """
+        return {src = Pointer(to=self)}
+
+    @always_inline
+    def _next_live(self, index: Int) -> Int:
+        """Returns the first live key index at or after `index`, else -1."""
+        var current = index
+        while current < self._keys.count:
+            comptime if Self.destructive:
+                if self._is_deleted(current):
+                    current += 1
+                    continue
+            return current
+        return -1
+
     def put(mut self, key: StringSlice, value: Self.V):
         """Inserts `key`, or replaces the value if it is already present.
 
@@ -451,7 +665,7 @@ struct StringDict[
             key: The key to insert. Its bytes are copied.
             value: The value to associate with it.
         """
-        if self.keys.count >= self.capacity - (self.capacity >> 3):
+        if self._keys.count >= self.capacity - (self.capacity >> 3):
             self._rehash()
 
         var key_hash = hash(key).cast[Self.KeyCountType]()
@@ -460,24 +674,24 @@ struct StringDict[
         while True:
             var key_index = Int(self.slot_to_index.unsafe_load(slot))
             if key_index == 0:
-                self.keys.add(key)
+                self._keys.add(key)
 
                 comptime if Self.caching_hashes:
                     self.key_hashes.unsafe_store(slot, key_hash)
-                self.values.append(value.copy())
+                self._values.append(value.copy())
                 self.count += 1
                 self.slot_to_index.unsafe_store(
-                    slot, Scalar[Self.KeyCountType](self.keys.count)
+                    slot, Scalar[Self.KeyCountType](self._keys.count)
                 )
                 return
 
             comptime if Self.caching_hashes:
                 var other_key_hash = self.key_hashes[unsafe_offset=slot]
                 if other_key_hash == key_hash:
-                    var other_key = self.keys[key_index - 1]
+                    var other_key = self._keys[key_index - 1]
                     if other_key == key:
                         # replace value
-                        self.values[key_index - 1] = value.copy()
+                        self._values[key_index - 1] = value.copy()
 
                         comptime if Self.destructive:
                             if self._is_deleted(key_index - 1):
@@ -485,10 +699,10 @@ struct StringDict[
                                 self._not_deleted(key_index - 1)
                         return
             else:
-                var other_key = self.keys[key_index - 1]
+                var other_key = self._keys[key_index - 1]
                 if other_key == key:
                     # replace value
-                    self.values[key_index - 1] = value.copy()
+                    self._values[key_index - 1] = value.copy()
 
                     comptime if Self.destructive:
                         if self._is_deleted(key_index - 1):
@@ -570,7 +784,7 @@ struct StringDict[
                 key_hash = self.key_hashes[unsafe_offset=i]
             else:
                 key_hash = hash(
-                    self.keys[Int(old_slot_to_index[unsafe_offset=i] - 1)]
+                    self._keys[Int(old_slot_to_index[unsafe_offset=i] - 1)]
                 ).cast[Self.KeyCountType]()
 
             var slot = Int(key_hash & Scalar[Self.KeyCountType](modulo_mask))
@@ -621,7 +835,7 @@ struct StringDict[
         comptime if Self.destructive:
             if self._is_deleted(key_index - 1):
                 return default.copy()
-        return self.values[key_index - 1].copy()
+        return self._values[key_index - 1].copy()
 
     def delete(mut self, key: StringSlice):
         """Removes `key`, if `destructive` is on and the key is present.
@@ -667,15 +881,15 @@ struct StringDict[
                 if self._is_deleted(key_index):
                     self.count += 1
                     self._not_deleted(key_index)
-                    self.values[key_index] = update(None)
+                    self._values[key_index] = update(None)
                     return
 
-            self.values[key_index] = update(self.values[key_index].copy())
+            self._values[key_index] = update(self._values[key_index].copy())
 
     def clear(mut self):
         """Removes every entry, keeping the allocated storage."""
-        self.values.clear()
-        self.keys.clear()
+        self._values.clear()
+        self._keys.clear()
         unsafe_memset_zero(self.slot_to_index, self.capacity)
 
         comptime if Self.destructive:
@@ -696,12 +910,323 @@ struct StringDict[
             comptime if Self.caching_hashes:
                 var other_key_hash = self.key_hashes[unsafe_offset=slot]
                 if key_hash == other_key_hash:
-                    var other_key = self.keys[key_index - 1]
+                    var other_key = self._keys[key_index - 1]
                     if other_key == key:
                         return key_index
             else:
-                var other_key = self.keys[key_index - 1]
+                var other_key = self._keys[key_index - 1]
                 if other_key == key:
                     return key_index
 
             slot = (slot + 1) & modulo_mask
+
+
+# ===-----------------------------------------------------------------------===#
+# Iterators
+# ===-----------------------------------------------------------------------===#
+
+
+comptime _DictOf[
+    V: Copyable & Deinitable,
+    KeyCountType: DType,
+    KeyOffsetType: DType,
+    destructive: Bool,
+    caching_hashes: Bool,
+] = StringDict[V, KeyCountType, KeyOffsetType, destructive, caching_hashes]
+"""Spelling out the map's five parameters once, for the iterators."""
+
+
+@fieldwise_init
+struct Entry[V: Copyable & Deinitable, origin: ImmOrigin](Copyable, Movable):
+    """One live entry, as yielded by `StringDict.items()`.
+
+    Parameters:
+        V: The value type.
+        origin: The origin of the map the key borrows from.
+    """
+
+    var key: StringSlice[Self.origin]
+    """The entry's key, borrowing the map's key buffer."""
+    var value: Self.V
+    """A copy of the entry's value."""
+
+
+struct _KeysIter[
+    mut: Bool,
+    //,
+    V: Copyable & Deinitable,
+    KeyCountType: DType,
+    KeyOffsetType: DType,
+    destructive: Bool,
+    caching_hashes: Bool,
+    origin: Origin[mut=mut],
+](ImplicitlyCopyable, Iterable, Iterator):
+    """Yields the live keys of a `StringDict`, in insertion order.
+
+    Parameters:
+        mut: Whether the borrow of the map is mutable.
+        V: The value type.
+        KeyCountType: The map's key count type.
+        KeyOffsetType: The map's key offset type.
+        destructive: Whether the map supports deletion.
+        caching_hashes: Whether the map caches hashes.
+        origin: The origin of the borrowed map.
+    """
+
+    comptime Element = StringSlice[ImmOrigin(Self.origin)]
+    comptime IteratorType[
+        iterable_mut: Bool, //, iterable_origin: Origin[mut=iterable_mut]
+    ]: Iterator = Self
+
+    var _src: Pointer[
+        _DictOf[
+            Self.V,
+            Self.KeyCountType,
+            Self.KeyOffsetType,
+            Self.destructive,
+            Self.caching_hashes,
+        ],
+        Self.origin,
+    ]
+    var _index: Int
+
+    def __init__(
+        out self,
+        src: Pointer[
+            _DictOf[
+                Self.V,
+                Self.KeyCountType,
+                Self.KeyOffsetType,
+                Self.destructive,
+                Self.caching_hashes,
+            ],
+            Self.origin,
+        ],
+    ):
+        """Starts at the first live entry.
+
+        Args:
+            src: The map to walk.
+        """
+        self._src = src
+        self._index = src[]._next_live(0)
+
+    def __iter__(ref self) -> Self.IteratorType[origin_of(self)]:
+        """Returns this iterator.
+
+        Returns:
+            A copy of `self`.
+        """
+        return self.copy()
+
+    def __next__(mut self) raises StopIteration -> Self.Element:
+        """Returns the next live key.
+
+        Raises:
+            StopIteration: When every entry has been yielded.
+
+        Returns:
+            The key, borrowing the map's key buffer.
+        """
+        if self._index == -1:
+            raise StopIteration()
+        var index = self._index
+        self._index = self._src[]._next_live(index + 1)
+        # The container hands back a slice carrying an origin interior to the
+        # map; rebuild it against the whole-map origin the iterator promises.
+        var borrowed = self._src[]._keys[index]
+        return StringSlice[ImmOrigin(Self.origin)](
+            unsafe_from_utf8=Span[Byte, ImmOrigin(Self.origin)](
+                unsafe_ptr=borrowed.unsafe_ptr().unsafe_origin_cast[
+                    ImmOrigin(Self.origin)
+                ](),
+                length=borrowed.byte_length(),
+            )
+        )
+
+
+struct _ValuesIter[
+    mut: Bool,
+    //,
+    V: Copyable & Deinitable,
+    KeyCountType: DType,
+    KeyOffsetType: DType,
+    destructive: Bool,
+    caching_hashes: Bool,
+    origin: Origin[mut=mut],
+](ImplicitlyCopyable, Iterable, Iterator):
+    """Yields references to the live values of a `StringDict`.
+
+    Parameters:
+        mut: Whether the borrow of the map is mutable.
+        V: The value type.
+        KeyCountType: The map's key count type.
+        KeyOffsetType: The map's key offset type.
+        destructive: Whether the map supports deletion.
+        caching_hashes: Whether the map caches hashes.
+        origin: The origin of the borrowed map.
+    """
+
+    comptime Element = Self.V
+    comptime IteratorType[
+        iterable_mut: Bool, //, iterable_origin: Origin[mut=iterable_mut]
+    ]: Iterator = Self
+
+    var _src: Pointer[
+        _DictOf[
+            Self.V,
+            Self.KeyCountType,
+            Self.KeyOffsetType,
+            Self.destructive,
+            Self.caching_hashes,
+        ],
+        Self.origin,
+    ]
+    var _index: Int
+
+    def __init__(
+        out self,
+        src: Pointer[
+            _DictOf[
+                Self.V,
+                Self.KeyCountType,
+                Self.KeyOffsetType,
+                Self.destructive,
+                Self.caching_hashes,
+            ],
+            Self.origin,
+        ],
+    ):
+        """Starts at the first live entry.
+
+        Args:
+            src: The map to walk.
+        """
+        self._src = src
+        self._index = src[]._next_live(0)
+
+    def __iter__(ref self) -> Self.IteratorType[origin_of(self)]:
+        """Returns this iterator.
+
+        Returns:
+            A copy of `self`.
+        """
+        return self.copy()
+
+    def __next__(
+        mut self,
+    ) raises StopIteration -> ref[Self.origin] Self.Element:
+        """Returns a reference to the next live value.
+
+        Raises:
+            StopIteration: When every entry has been yielded.
+
+        Returns:
+            A reference to the value, borrowing the map.
+        """
+        if self._index == -1:
+            raise StopIteration()
+        var index = self._index
+        self._index = self._src[]._next_live(index + 1)
+        # `List.__getitem__` vends an interior origin, which cannot widen to
+        # the whole-map origin an iterator's references need.
+        return (
+            self._src[]
+            ._values.unsafe_ptr()
+            .unsafe_origin_cast[Self.origin]()[unsafe_offset=index]
+        )
+
+
+struct _ItemsIter[
+    mut: Bool,
+    //,
+    V: Copyable & Deinitable,
+    KeyCountType: DType,
+    KeyOffsetType: DType,
+    destructive: Bool,
+    caching_hashes: Bool,
+    origin: Origin[mut=mut],
+](ImplicitlyCopyable, Iterable, Iterator):
+    """Yields the live entries of a `StringDict`, in insertion order.
+
+    Parameters:
+        mut: Whether the borrow of the map is mutable.
+        V: The value type.
+        KeyCountType: The map's key count type.
+        KeyOffsetType: The map's key offset type.
+        destructive: Whether the map supports deletion.
+        caching_hashes: Whether the map caches hashes.
+        origin: The origin of the borrowed map.
+    """
+
+    comptime Element = Entry[Self.V, ImmOrigin(Self.origin)]
+    comptime IteratorType[
+        iterable_mut: Bool, //, iterable_origin: Origin[mut=iterable_mut]
+    ]: Iterator = Self
+
+    var _src: Pointer[
+        _DictOf[
+            Self.V,
+            Self.KeyCountType,
+            Self.KeyOffsetType,
+            Self.destructive,
+            Self.caching_hashes,
+        ],
+        Self.origin,
+    ]
+    var _index: Int
+
+    def __init__(
+        out self,
+        src: Pointer[
+            _DictOf[
+                Self.V,
+                Self.KeyCountType,
+                Self.KeyOffsetType,
+                Self.destructive,
+                Self.caching_hashes,
+            ],
+            Self.origin,
+        ],
+    ):
+        """Starts at the first live entry.
+
+        Args:
+            src: The map to walk.
+        """
+        self._src = src
+        self._index = src[]._next_live(0)
+
+    def __iter__(ref self) -> Self.IteratorType[origin_of(self)]:
+        """Returns this iterator.
+
+        Returns:
+            A copy of `self`.
+        """
+        return self.copy()
+
+    def __next__(mut self) raises StopIteration -> Self.Element:
+        """Returns the next live entry.
+
+        Raises:
+            StopIteration: When every entry has been yielded.
+
+        Returns:
+            The entry, with a borrowed key and a copied value.
+        """
+        if self._index == -1:
+            raise StopIteration()
+        var index = self._index
+        self._index = self._src[]._next_live(index + 1)
+        var borrowed = self._src[]._keys[index]
+        var key = StringSlice[ImmOrigin(Self.origin)](
+            unsafe_from_utf8=Span[Byte, ImmOrigin(Self.origin)](
+                unsafe_ptr=borrowed.unsafe_ptr().unsafe_origin_cast[
+                    ImmOrigin(Self.origin)
+                ](),
+                length=borrowed.byte_length(),
+            )
+        )
+        return Entry[Self.V, ImmOrigin(Self.origin)](
+            key, self._src[]._values[index].copy()
+        )

@@ -185,7 +185,7 @@ def report_memory(keys: List[String]) raises:
     print("memory for", len(keys), "keys of 12 bytes")
     print(
         "   StringDict         ",
-        map.keys.allocated_bytes,
+        map.key_bytes(),
         "bytes of key storage,",
         map.capacity,
         "slots",
