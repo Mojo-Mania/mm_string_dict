@@ -1,245 +1,248 @@
 """Benchmarks `StringDict` against the stdlib `Dict[String, Int]`.
 
-The difference is where the keys live. `Dict` stores a `String` per entry, each
-with its own heap allocation once it outgrows the inline buffer; `StringDict`
-appends every key into one byte buffer and keeps an end offset per key. That
-should show up on build time and on memory, and cost nothing on lookup.
+The keys are real words, not generated ones -- twelve corpora covering Latin,
+Greek, Hebrew, Arabic, Georgian, Devanagari and CJK, plus a list of AWS S3
+action names for long ASCII identifiers. Real keys repeat, vary in length, and
+run to several bytes per character, and none of that is visible in a benchmark
+built from fixed-length random strings.
 
-Every number is nanoseconds per operation. Lower is better. The keys come from
-a fixed seed, so runs are comparable.
+Building is reported as the total time to index a whole corpus, not as a
+per-word average: two of the corpora hold ten keys each, and dividing out a
+constructor across ten inserts produces noise rather than a per-insert cost.
+Lookups are per operation, where there is nothing fixed to amortize.
 
-One caveat: these all run in one process, and a benchmark's allocator state
-carries into the next, which moves the build figures by a few nanoseconds. The
-build numbers quoted in the README were taken one variant per process.
+One synthetic case remains, at the end: the corpora are at most a thousand
+words, so nothing else here fills a table far enough to show what probing costs
+near the growth threshold.
 """
 
+from corpora import describe, load, names
 from mm_string_dict import StringDict
 from std.benchmark import Unit, keep, run
-
-
-comptime SIZE = 20_000
-"""Entries per map."""
-
-
-struct Rng(Copyable, Movable):
-    """A xorshift64 generator, so every run sees the same keys."""
-
-    var state: UInt64
-
-    def __init__(out self, seed: UInt64):
-        self.state = seed
-
-    def next(mut self) -> Int:
-        self.state ^= self.state << 13
-        self.state ^= self.state >> 7
-        self.state ^= self.state << 17
-        return Int(self.state & 0x7FFF_FFFF)
-
-
-comptime _ALPHABET: StaticString = "abcdefghijklmnopqrstuvwxyz0123456789"
-
-
-def random_keys(
-    count: Int, length: Int = 12, seed: UInt64 = 0x2545_F491_4F6C_DD1D
-) -> List[String]:
-    var rng = Rng(seed)
-    var result = List[String](capacity=count)
-    for _ in range(count):
-        var value = String()
-        for _ in range(length):
-            value += _ALPHABET[byte=rng.next() % 36]
-        result.append(value^)
-    return result^
 
 
 def measure(f: Some[ImplicitlyCopyable & (def() raises)]) raises -> Float64:
     return run(f, min_runtime_secs=0.05, max_runtime_secs=1.0).mean(Unit.ns)
 
 
-def fmt(nanos: Float64) -> String:
-    var tenths = Int(nanos * 10.0 + 0.5)
+def fmt(value: Float64) -> String:
+    var tenths = Int(value * 10.0 + 0.5)
     return String(tenths // 10, ".", tenths % 10)
 
 
-def header(title: String):
+def pad(text: String, width: Int) -> String:
+    var padded = text
+    while padded.byte_length() < width:
+        padded += " "
+    return padded^
+
+
+def rpad(text: String, width: Int) -> String:
+    var padded = text
+    while padded.byte_length() < width:
+        padded = " " + padded
+    return padded^
+
+
+def row(label: String, ours: Float64, theirs: Float64):
+    print("  ", pad(label, 12), rpad(fmt(ours), 8), rpad(fmt(theirs), 8))
+
+
+def header(title: String, unit: String):
     print("")
     print(title)
-    print("  container            ns/op")
-    print("  ---------------------------")
+    print("   corpus     ", rpad("StringDict", 8), rpad("stdlib", 8), " ", unit)
+    print("   -------------------------------------")
 
 
-def report(name: String, nanos: Float64):
-    var padded = name
-    while padded.byte_length() < 20:
-        padded += " "
-    print("  ", padded, fmt(nanos))
+def bench_build(corpora: List[String]) raises:
+    header("index a whole corpus", "microseconds")
+    for name in corpora:
+        var words = load(name)
+
+        def ours() raises {imm words}:
+            var map = StringDict[Int]()
+            for i in range(len(words)):
+                map.put(words[i], i)
+            keep(len(map))
+
+        def theirs() raises {imm words}:
+            var map = Dict[String, Int]()
+            for i in range(len(words)):
+                map[words[i]] = i
+            keep(len(map))
+
+        row(name, measure(ours) / 1000.0, measure(theirs) / 1000.0)
 
 
-def per_op(total_ns: Float64, operations: Int) -> Float64:
-    return total_ns / Float64(operations)
+def bench_word_count(corpora: List[String]) raises:
+    header("count word frequencies over a whole corpus", "microseconds")
+    for name in corpora:
+        var words = load(name)
+
+        def bump(value: Optional[Int]) -> Int:
+            return value.value() + 1 if value else 1
+
+        def ours() raises {imm words}:
+            var map = StringDict[Int]()
+            for i in range(len(words)):
+                map.upsert(words[i], bump)
+            keep(len(map))
+
+        def theirs() raises {imm words}:
+            var map = Dict[String, Int]()
+            for i in range(len(words)):
+                try:
+                    map[words[i]] = map[words[i]] + 1
+                except:
+                    map[words[i]] = 1
+            keep(len(map))
+
+        row(name, measure(ours) / 1000.0, measure(theirs) / 1000.0)
 
 
-def bench_build(title: String, keys: List[String]) raises:
-    header(title)
-    var count = len(keys)
-
-    def build_dict() raises {imm keys}:
+def bench_lookup(corpora: List[String]) raises:
+    header("look up every word, all present", "ns per lookup")
+    for name in corpora:
+        var words = load(name)
+        var count = Float64(len(words))
         var map = StringDict[Int]()
-        for i in range(len(keys)):
-            map.put(keys[i], i)
-        keep(len(map))
+        var theirs_map = Dict[String, Int]()
+        for i in range(len(words)):
+            map.put(words[i], i)
+            theirs_map[words[i]] = i
 
-    def build_stdlib() raises {imm keys}:
-        var map = Dict[String, Int]()
-        for i in range(len(keys)):
-            map[keys[i]] = i
-        keep(len(map))
+        def ours() raises {imm map, imm words}:
+            var total = 0
+            for i in range(len(words)):
+                total += map.get(words[i], 0)
+            keep(total)
 
-    report("StringDict", per_op(measure(build_dict), count))
-    report("stdlib Dict", per_op(measure(build_stdlib), count))
+        def theirs() raises {imm theirs_map, imm words}:
+            var total = 0
+            for i in range(len(words)):
+                try:
+                    total += theirs_map[words[i]]
+                except:
+                    pass
+            keep(total)
 
-
-def bench_lookup(
-    title: String, keys: List[String], probes: List[String]
-) raises:
-    header(title)
-    var count = len(probes)
-
-    var map = StringDict[Int]()
-    var stdlib = Dict[String, Int]()
-    for i in range(len(keys)):
-        map.put(keys[i], i)
-        stdlib[keys[i]] = i
-
-    def probe_dict() raises {imm map, imm probes}:
-        var total = 0
-        for i in range(len(probes)):
-            total += map.get(probes[i], 0)
-        keep(total)
-
-    def probe_stdlib() raises {imm stdlib, imm probes}:
-        var total = 0
-        for i in range(len(probes)):
-            try:
-                total += stdlib[probes[i]]
-            except:
-                pass
-        keep(total)
-
-    report("StringDict", per_op(measure(probe_dict), count))
-    report("stdlib Dict", per_op(measure(probe_stdlib), count))
+        row(name, measure(ours) / count, measure(theirs) / count)
 
 
-def bench_contains(keys: List[String], probes: List[String]) raises:
-    header("membership, no probe present (per lookup)")
-    var count = len(probes)
+def bench_absent(corpora: List[String]) raises:
+    header("membership, probes from another script", "ns per lookup")
+    for name in corpora:
+        var words = load(name)
+        # Words in a different script are absent, and their hashes are
+        # uncorrelated with the stored ones.
+        var probes = load("georgian" if name != "georgian" else "hindi")
+        var count = Float64(len(probes))
+        var map = StringDict[Int]()
+        var theirs_map = Dict[String, Int]()
+        for i in range(len(words)):
+            map.put(words[i], i)
+            theirs_map[words[i]] = i
 
-    var map = StringDict[Int]()
-    var stdlib = Dict[String, Int]()
-    for i in range(len(keys)):
-        map.put(keys[i], i)
-        stdlib[keys[i]] = i
+        def ours() raises {imm map, imm probes}:
+            var hits = 0
+            for i in range(len(probes)):
+                if probes[i] in map:
+                    hits += 1
+            keep(hits)
 
-    def probe_dict() raises {imm map, imm probes}:
-        var hits = 0
-        for i in range(len(probes)):
-            if probes[i] in map:
-                hits += 1
-        keep(hits)
+        def theirs() raises {imm theirs_map, imm probes}:
+            var hits = 0
+            for i in range(len(probes)):
+                if probes[i] in theirs_map:
+                    hits += 1
+            keep(hits)
 
-    def probe_stdlib() raises {imm stdlib, imm probes}:
-        var hits = 0
-        for i in range(len(probes)):
-            if probes[i] in stdlib:
-                hits += 1
-        keep(hits)
-
-    report("StringDict", per_op(measure(probe_dict), count))
-    report("stdlib Dict", per_op(measure(probe_stdlib), count))
+        row(name, measure(ours) / count, measure(theirs) / count)
 
 
-def report_memory(keys: List[String]) raises:
-    var map = StringDict[Int]()
-    for i in range(len(keys)):
-        map.put(keys[i], i)
-    var key_bytes = 0
-    for i in range(len(keys)):
-        key_bytes += keys[i].byte_length()
+def report_density(corpora: List[String]) raises:
     print("")
-    print("memory for", len(keys), "keys of 12 bytes")
-    print(
-        "   StringDict         ",
-        map.key_bytes(),
-        "bytes of key storage,",
-        map.capacity,
-        "slots",
-    )
-    print("   the keys themselves", key_bytes, "bytes")
-    print(
-        "   stdlib Dict         one String header per entry, plus its"
-        " allocation"
-    )
+    print("key storage: allocated key buffer against the bytes the keys need")
+    print("   corpus        keys   needed   buffer   ratio")
+    print("   --------------------------------------------")
+    for name in corpora:
+        var words = load(name)
+        var map = StringDict[Int]()
+        for i in range(len(words)):
+            map.put(words[i], i)
+        var needed = 0
+        for key in map.keys():
+            needed += key.byte_length()
+        # `key_bytes()` is the allocated buffer, so the gap is unused tail left
+        # by the last growth step, not per-key overhead: the keys sit end to end
+        # with no separator and no per-key header. Repeated words are stored
+        # once -- english needs 1034 bytes for its 999 words.
+        print(
+            "  ",
+            pad(name, 12),
+            rpad(String(len(map)), 5),
+            rpad(String(needed), 8),
+            rpad(String(map.key_bytes()), 8),
+            rpad(fmt(Float64(map.key_bytes()) / Float64(needed)), 7),
+        )
 
 
-def bench_at_high_load(keys: List[String], misses: List[String]) raises:
-    """The same lookups with the table nearly full.
+def bench_at_high_load() raises:
+    """The one synthetic case: a table filled to just under the growth point.
 
-    The default benchmark sits at 61% load, because the table doubles at 87.5%
-    and had just done so. Probe chains are short there. This fills a table to
-    just under the threshold, which is where probing actually costs something.
+    The corpora are too small to reach it, and this is where probing either
+    holds up or falls apart.
     """
+    comptime ALPHABET: StaticString = "abcdefghijklmnopqrstuvwxyz0123456789"
     comptime FILL = 28_000  # 85% of 32768
-    header("lookup at 85% load (per lookup)")
+    comptime PROBES = 4000
+
+    var state: UInt64 = 0x2545_F491_4F6C_DD1D
+    var keys = List[String](capacity=FILL + PROBES)
+    for _ in range(FILL + PROBES):
+        var word = String()
+        for _ in range(12):
+            state ^= state << 13
+            state ^= state >> 7
+            state ^= state << 17
+            word += ALPHABET[byte=Int(state & 0x7FFF_FFFF) % 36]
+        keys.append(word^)
 
     var map = StringDict[Int]()
-    var stdlib = Dict[String, Int]()
+    var theirs_map = Dict[String, Int]()
     for i in range(FILL):
         map.put(keys[i], i)
-        stdlib[keys[i]] = i
+        theirs_map[keys[i]] = i
 
-    var probes = List[String](capacity=4000)
-    for i in range(4000):
-        probes.append(misses[i])
-    var count = len(probes)
-
-    def miss_dict() raises {imm map, imm probes}:
+    def ours() raises {imm map, imm keys}:
         var hits = 0
-        for i in range(len(probes)):
-            if probes[i] in map:
+        for i in range(FILL, FILL + PROBES):
+            if keys[i] in map:
                 hits += 1
         keep(hits)
 
-    def miss_stdlib() raises {imm stdlib, imm probes}:
+    def theirs() raises {imm theirs_map, imm keys}:
         var hits = 0
-        for i in range(len(probes)):
-            if probes[i] in stdlib:
+        for i in range(FILL, FILL + PROBES):
+            if keys[i] in theirs_map:
                 hits += 1
         keep(hits)
 
-    def hit_dict() raises {imm map, imm keys}:
-        var total = 0
-        for i in range(4000):
-            total += map.get(keys[i], 0)
-        keep(total)
-
-    report("StringDict, miss", per_op(measure(miss_dict), count))
-    report("stdlib Dict, miss", per_op(measure(miss_stdlib), count))
-    report("StringDict, hit", per_op(measure(hit_dict), 4000))
+    header("synthetic: absent probe, table 85% full", "ns per lookup")
+    row("28000 keys", measure(ours) / PROBES, measure(theirs) / PROBES)
 
 
 def main() raises:
-    print("StringDict benchmarks --", SIZE, "entries, ns per operation")
-    var keys = random_keys(SIZE)
-    var misses = random_keys(SIZE, seed=0xDEAD_BEEF_CAFE_F00D)
+    var corpora = names()
 
-    bench_build("build from random keys (per insert)", keys)
-    bench_lookup("lookup, every probe present (per lookup)", keys, keys)
-    bench_contains(keys, misses)
-    bench_at_high_load(
-        random_keys(30_000), random_keys(30_000, seed=0x1234_5678)
-    )
+    print("corpora")
+    for name in corpora:
+        print("  ", pad(name, 12), describe(load(name)))
 
-    var long_keys = random_keys(SIZE, length=64)
-    bench_build("build from 64-byte keys (per insert)", long_keys)
-
-    report_memory(keys)
+    bench_build(corpora)
+    bench_word_count(corpora)
+    bench_lookup(corpora)
+    bench_absent(corpora)
+    report_density(corpora)
+    bench_at_high_load()

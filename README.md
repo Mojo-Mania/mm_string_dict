@@ -100,42 +100,125 @@ StringDict[Int, DType.uint32, DType.uint32, True, True]   # cache full hashes to
 
 ## Performance
 
-20000 entries of 12 random characters, Apple M-series, release build
-(`-D ASSERT=none`, which is what `pixi run bench` passes). Nanoseconds per
-operation, lower is better.
+Apple M-series, release build (`-D ASSERT=none`, which is what `pixi run bench`
+passes), measured against the stdlib `Dict[String, Int]`.
 
-| Operation | StringDict | stdlib `Dict[String, Int]` |
-| --- | --- | --- |
-| lookup, present | **14.9** | 15.1 |
-| membership, absent | **3.2** | 3.5 |
-| membership, absent, table at 85% load | **3.8** | 3.4 |
-| build | 19.5 | **16.8** |
+The keys are real words. `corpora/` holds twelve word lists — Latin, Greek,
+Hebrew, Arabic, Georgian, Devanagari and CJK scripts, plus a list of AWS S3
+action names for long ASCII identifiers — taken from
+[compact-dict](https://github.com/mzaks/compact-dict). Real keys repeat, vary
+in length, and run to several bytes per character, and none of that shows up in
+a benchmark built from fixed-length random strings.
 
-Lookups are now level with the stdlib `Dict`, and the high-load case — the one
-that used to fall apart — holds up: before the control byte, a miss at 85% load
-walked 24 slots on average and up to 468, because deleting never freed a slot
-and linear probing clustered. Now a probe scans 16 slots per compare and stops
-at the first group containing an empty one.
+| corpus | words | distinct | avg bytes | range |
+| --- | --- | --- | --- | --- |
+| english | 999 | 192 | 4 | 1–13 |
+| german | 999 | 208 | 5 | 2–18 |
+| l33t | 487 | 339 | 4 | 2–14 |
+| french | 471 | 418 | 6 | 2–19 |
+| greek | 452 | 320 | 10 | 3–28 |
+| arabic | 463 | 336 | 9 | 2–26 |
+| hebrew | 376 | 231 | 8 | 2–25 |
+| hindi | 450 | 250 | 18 | 9–51 |
+| georgian | 381 | 250 | 15 | 6–42 |
+| s3_actions | 161 | 143 | 22 | 8–43 |
+| chinese | 10 | 10 | 464 | 441–480 |
+| japanese | 10 | 10 | 499 | 378–558 |
 
-Inserts are still ~16% behind, which is where the remaining work is.
+### Lookups
 
-**Memory is the reason to reach for this.** 20000 twelve-byte keys are 240000
-bytes; the container holds them in 283702 bytes of buffer plus 80000 bytes of
-offsets — about 1.5 bytes of overhead per key. A `Dict[String, Int]` stores a
-`String` per entry instead: 24 bytes of header each before any of its bytes,
+Nanoseconds per lookup, lower is better.
+
+| corpus | look up every word | | membership, probe from another script | |
+| --- | --- | --- | --- | --- |
+| | StringDict | stdlib | StringDict | stdlib |
+| english | 7.0 | **6.5** | **2.5** | 2.8 |
+| german | 7.6 | **7.4** | **2.9** | 3.1 |
+| l33t | **7.1** | 7.2 | **2.2** | 2.5 |
+| french | 8.3 | **8.2** | **2.6** | 2.9 |
+| greek | **8.2** | 8.7 | **2.3** | 2.6 |
+| arabic | **9.2** | 9.4 | **2.3** | 2.6 |
+| hebrew | 9.1 | **9.0** | **2.2** | 2.5 |
+| hindi | **8.7** | 9.0 | **2.2** | 2.5 |
+| georgian | 8.5 | **8.1** | **2.2** | 2.5 |
+| s3_actions | 7.0 | **6.6** | **2.2** | 2.5 |
+| chinese | 37.7 | **24.4** | **2.2** | 2.5 |
+| japanese | 48.6 | **27.3** | **2.3** | 2.5 |
+
+Present-key lookups are level with the stdlib `Dict` across every corpus with
+keys of an ordinary size, and misses are consistently a little faster — the
+7-bit tag in the control byte rejects a wrong key without touching the key
+bytes at all.
+
+The two CJK corpora are the exception, and the gap there grows with key length:
+their "words" are whole paragraphs of 400–560 bytes, and a hit has to compare
+all of them. That is a real gap, not measurement noise, and it is unexplained —
+both sides bottom out in the same stdlib byte comparison. See
+[`docs/improvements.md`](docs/improvements.md).
+
+A miss with the table at 85% load is the case that used to fall apart: before
+the control byte, it walked 24 slots on average and up to 468, because deleting
+never freed a slot and linear probing clustered. The corpora are far too small
+to reach that load, so the benchmark keeps one synthetic case for it — 28000
+keys in 32768 slots, where a miss costs **3.8 ns** against the stdlib's 3.4 ns.
+
+### Building
+
+Microseconds to index a whole corpus, lower is better. Reported per corpus
+rather than per word: two of these hold ten keys, and dividing a constructor
+across ten inserts measures the constructor, not the insert.
+
+| corpus | build a map | | count word frequencies | |
+| --- | --- | --- | --- | --- |
+| | StringDict | stdlib | StringDict | stdlib |
+| english | 14.5 | **10.0** | **11.7** | 18.2 |
+| german | 14.9 | **10.9** | **12.6** | 19.5 |
+| l33t | 11.6 | **7.3** | **10.8** | 11.0 |
+| french | 12.0 | **7.2** | 12.0 | **11.2** |
+| greek | 11.6 | **7.5** | 11.0 | **10.9** |
+| arabic | 12.0 | **7.5** | **11.2** | 11.3 |
+| hebrew | 10.0 | **7.1** | **9.4** | 10.3 |
+| hindi | 11.6 | **7.9** | **11.1** | 12.2 |
+| georgian | 10.9 | **7.3** | **10.3** | 10.6 |
+| s3_actions | 6.0 | **3.8** | 6.2 | **5.1** |
+| chinese | 1.2 | **0.4** | 1.3 | **0.7** |
+| japanese | 1.3 | **0.4** | 1.5 | **0.8** |
+
+Inserting is about 1.5× slower than the stdlib `Dict`, and that is the standing
+weakness. Each `put` touches four separate allocations — the packed key bytes,
+the end offsets, the slot table and the values — where a `Dict` appends one
+entry to one array.
+
+Word counting is the workload where that reverses: on english and german, where
+999 words collapse to about 200 distinct ones, `upsert` runs a single probe per
+word and comes out 35% ahead of a `Dict`'s read-then-write pair. Where a corpus
+is nearly all distinct words, the two are level and the insert cost decides.
+
+### Memory
+
+This is the reason to reach for the library. Keys are stored end to end in one
+buffer with a parallel array of end offsets: no per-key header, no allocation
+per key, and a repeated word stored once.
+
+| corpus | distinct keys | bytes of keys | key buffer |
+| --- | --- | --- | --- |
+| english | 192 | 1034 | 1458 |
+| german | 208 | 1359 | 1458 |
+| s3_actions | 143 | 3233 | 3280 |
+| hindi | 250 | 4555 | 4920 |
+| japanese | 10 | 4992 | 7380 |
+
+The buffer runs 1.0–1.5× the bytes the keys need, and the excess is unused tail
+from the last growth step, not per-key overhead. A `Dict[String, Int]` instead
+stores a `String` per entry: 24 bytes of header each before any of its bytes,
 and a separate allocation once a key outgrows the inline buffer. The slot table
 costs 5 bytes per slot (1 control byte + 4 index), down from 8 before the
 control byte replaced the cached hash.
 
-A note on the benchmark suite: it runs everything in one process, and a
-benchmark's allocator state carries into the next, which moves the build
-figures by a few nanoseconds either way. The build numbers above were taken one
-variant per process.
-
 ## Development
 
 ```bash
-pixi run test     # the test suite (42 tests)
+pixi run test     # the test suite (47 tests)
 pixi run bench    # the benchmarks above
 pixi run main     # the example
 pixi run format   # mojo format
@@ -149,6 +232,10 @@ This is Maxim Zaks' `StringDict`, which also lives in the Mojo standard
 library's benchmark suite. Packaged here as a library, with tests, benchmarks,
 a `Dict`-shaped API, and three bug fixes — see
 [`docs/fixes.md`](docs/fixes.md).
+
+The word lists in `corpora/` come from
+[mzaks/compact-dict](https://github.com/mzaks/compact-dict), where this
+implementation started.
 
 ## License
 

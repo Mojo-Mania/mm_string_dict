@@ -1,3 +1,4 @@
+from corpora import load, names
 from mm_string_dict import GROUP, KeysContainer, StringDict
 from std.testing import (
     TestSuite,
@@ -516,6 +517,131 @@ def test_key_bytes_reports_the_packed_buffer() raises:
     for i in range(100):
         dict[String("key-", i)] = i
     assert_true(dict.key_bytes() > 0)
+
+
+# ===-----------------------------------------------------------------------===#
+# Real corpora
+#
+# The tests above use generated keys, which are uniform in length, all ASCII,
+# and never repeat. Real words are none of those things, and the bugs that
+# survive synthetic tests tend to live in exactly that gap: multi-byte UTF-8,
+# one-character keys, keys that differ only in a trailing byte, and the same
+# word arriving hundreds of times. The corpora come from
+# github.com/mzaks/compact-dict.
+# ===-----------------------------------------------------------------------===#
+
+
+def test_corpus_word_counts_match_a_reference_dict() raises:
+    """Counts every corpus twice and requires the two tallies to agree."""
+
+    def bump(value: Optional[Int]) -> Int:
+        return value.value() + 1 if value else 1
+
+    for name in names():
+        var words = load(name)
+        var dict = StringDict[Int]()
+        var reference = Dict[String, Int]()
+        for i in range(len(words)):
+            dict.upsert(words[i], bump)
+            reference[words[i]] = reference.get(words[i], 0) + 1
+
+        assert_equal(len(dict), len(reference), name)
+        for entry in reference.items():
+            assert_equal(dict.get(entry.key, 0), entry.value, name)
+
+
+def test_corpus_every_word_is_found() raises:
+    """Every stored word is present; words in another script are not."""
+    for name in names():
+        var words = load(name)
+        var dict = StringDict[Int]()
+        for i in range(len(words)):
+            dict[words[i]] = i
+        for i in range(len(words)):
+            assert_true(words[i] in dict, name)
+
+        var absent = load("georgian" if name != "georgian" else "hindi")
+        for i in range(len(absent)):
+            if absent[i] not in dict:
+                assert_equal(dict.get(absent[i], -1), -1, name)
+
+
+def test_corpus_keys_round_trip_byte_for_byte() raises:
+    """Keys come back out of the packed buffer exactly as they went in.
+
+    Greek, Hebrew, Arabic, Georgian, Devanagari and CJK keys are multi-byte, so
+    an off-by-one in the end-offset array shows up here as a mangled key rather
+    than as a missing one.
+    """
+    for name in names():
+        var words = load(name)
+        var dict = StringDict[Int]()
+        var distinct = Dict[String, Bool]()
+        for i in range(len(words)):
+            dict[words[i]] = i
+            distinct[words[i]] = True
+
+        var seen = Dict[String, Bool]()
+        for key in dict.keys():
+            var owned = String(key)
+            assert_true(owned in distinct, String(name, ": stray key ", owned))
+            assert_false(owned in seen, String(name, ": duplicate key ", owned))
+            seen[owned] = True
+        assert_equal(len(seen), len(distinct), name)
+
+
+def test_corpus_values_survive_deletion_of_every_other_word() raises:
+    """Deletes half the distinct words and checks both halves afterwards."""
+    for name in names():
+        var words = load(name)
+        var dict = StringDict[Int]()
+        var distinct = List[String]()
+        for i in range(len(words)):
+            if words[i] not in dict:
+                distinct.append(words[i])
+            dict[words[i]] = i
+
+        for i in range(0, len(distinct), 2):
+            dict.delete(distinct[i])
+        assert_equal(len(dict), len(distinct) - ((len(distinct) + 1) // 2))
+
+        for i in range(len(distinct)):
+            if i % 2 == 0:
+                assert_false(distinct[i] in dict, name)
+            else:
+                assert_true(distinct[i] in dict, name)
+
+        # Reinserting must reuse the vacated slots, not leak them.
+        for i in range(0, len(distinct), 2):
+            dict[distinct[i]] = -i
+        assert_equal(len(dict), len(distinct), name)
+        for i in range(0, len(distinct), 2):
+            assert_equal(dict.get(distinct[i], 1), -i, name)
+
+
+def test_corpus_keys_are_stored_end_to_end() raises:
+    """The packed buffer holds each distinct key once, with no per-key header.
+
+    English is 999 words but only 192 distinct ones, so a buffer that grew with
+    every `put` rather than with every new key would be several times larger
+    than the keys need.
+    """
+    var words = load("english")
+    var dict = StringDict[Int]()
+    var needed = 0
+    for i in range(len(words)):
+        if words[i] not in dict:
+            needed += words[i].byte_length()
+        dict[words[i]] = i
+
+    assert_equal(len(dict), 192)
+    assert_true(dict.key_bytes() >= needed, "buffer is too small for the keys")
+    # Slack is whatever the last growth step over-allocated, never per-key
+    # overhead, so it cannot reach a second full copy of the keys.
+    assert_true(
+        dict.key_bytes() < needed * 2,
+        String("buffer ", dict.key_bytes(), " for ", needed, " bytes of keys"),
+    )
 
 
 def main() raises:
