@@ -185,9 +185,13 @@ across ten inserts measures the constructor, not the insert.
 | japanese | 1.2 | **0.5** | 1.5 | **0.8** |
 
 Inserting is about 1.4× slower than the stdlib `Dict`, and that is the standing
-weakness. Each `put` touches four separate allocations — the packed key bytes,
-the end offsets, the slot table and the values — where a `Dict` appends one
-entry to one array.
+weakness — but not where it looks. Taking an insert apart
+(`pixi run bench-anatomy`), a steady-state `put` is already even at 10.8 ns
+against 11.8, and inserting into a pre-sized map is within 4%. The whole gap is
+table growth, which costs 12.3 ns per insert here against the stdlib's 9.0, and
+most of that difference is `_rehash` recomputing a hash for every entry it moves
+where the stdlib reuses a stored one. If you know the size up front, passing
+`StringDict[Int](capacity=n)` removes it.
 
 Word counting is where that reverses, and it now does so on ten of the twelve
 corpora. `upsert` settles a word in one probe against a `Dict`'s read-then-write
@@ -249,6 +253,7 @@ pixi run test     # the test suite (48 tests)
 pixi run bench    # the benchmarks above
 pixi run bench-destructive      # the destructive=True variant, alone
 pixi run bench-non-destructive  # the destructive=False variant, alone
+pixi run bench-anatomy          # where an insert's time actually goes
 pixi run main     # the example
 pixi run format   # mojo format
 pixi run docs     # docstring check

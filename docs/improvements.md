@@ -5,22 +5,63 @@ Open items, most worthwhile first. Numbers are release builds
 
 ## 1. Inserts are ~1.4x behind the stdlib `Dict`
 
-Indexing the english corpus takes 14.5 us against the stdlib's 9.9, and every
-corpus shows a similar ratio. Lookups are level; inserts are not.
+Indexing the english corpus takes 14.5 us against the stdlib's 9.9. Taking an
+insert apart (`pixi run bench-anatomy`) says where that goes, and it is not
+where "inserts are slower" suggests:
 
-The structural cause is visible without profiling: a `put` writes into four
-regions that grow independently -- the packed key bytes, the end offsets, the
-slot table and the values -- where a `Dict` appends one entry to one array.
-That is the same thing item 4 proposes to fix, and it is the more promising of
-the two framings.
+| | StringDict | stdlib |
+| --- | --- | --- |
+| construct + destruct an empty map | 269.6 ns | 0.2 ns |
+| put, steady state, no growth or new keys | 10.8 ns | 11.8 ns |
+| insert, 4000 distinct keys, pre-sized | 10.8 ns | 10.4 ns |
+| insert, 4000 distinct keys, growing from empty | 23.0 ns | 19.4 ns |
+| so growth costs | 12.3 ns | 9.0 ns |
 
-The remaining candidate worth a measurement is the two group scans `put` does,
-one for an existing key and one for a free slot.
+Three separate findings:
 
-Note that `upsert` already beats the stdlib on ten of the twelve corpora,
-because it settles a word in one probe where a `Dict` needs a read and then a
-write. The insert gap only decides the outcome when a corpus is nearly all
-distinct words.
+1. **Steady state is already even**, and slightly ahead. The probe and its
+   writes are not the problem.
+2. **Pre-sized, the gap is 4%.** Give the map its capacity up front and there
+   is essentially nothing in it.
+3. **Growth is more than half of an insert** for both implementations, and
+   ours costs 3.3 ns more per insert than theirs. That is the whole gap.
+
+Inside growth, `_rehash` recomputes `hash()` for every entry it moves, because
+neither the 7-bit control byte nor the narrowed cached hash can rebuild a tag
+for the new table. Doubling moves about two entries per insert amortized, and
+one hash of a 10-byte key is 1.2 ns, so re-hashing accounts for roughly 2.4 of
+the 3.3 ns.
+
+### The fix that follows: let `_rehash` reuse hashes
+
+It needs a full 64-bit hash per *entry* -- not the current `caching_hashes`,
+which stores a hash narrowed to `KeyCountType` per *slot*, and is therefore
+useless to a rehash on both counts. Keyed by entry it also survives the rehash
+that invalidates every slot.
+
+The price is 8 bytes per entry, against a map that costs roughly 35, so it is a
+real trade against the density this library exists for. It belongs behind the
+`caching_hashes` parameter, redesigned, rather than as an unconditional cost.
+
+### Fewer allocations, the way the trees do it
+
+`mm_fiby_tree` and `mm_lcrs_tree` hold all their index regions in one
+allocation. The same treatment here would merge the three capacity-sized arrays
+-- control bytes, slot indices and cached hashes, which are already reallocated
+together in `_rehash` -- into one region, and take a constructor from six
+allocations to four.
+
+Measured against the numbers above, this is worth doing for the **fixed cost**,
+not for the insert gap: growth allocates O(log n) times over a build, which is
+nothing per insert, so merging cannot touch the 3.3 ns. What it touches is the
+269.6 ns to construct a map, which matters when a program holds many small maps
+rather than one big one -- and for the ten-key CJK corpora, where construction
+is about a quarter of the measured build.
+
+For that fixed cost, though, the bigger lever is **allocating nothing until the
+first insert**, which is what the stdlib `Dict` does to reach 0.2 ns. Merging
+six allocations into four removes perhaps a third of the constructor; deferring
+them removes all of it. Worth doing in that order.
 
 ### Fixed: the tombstone mask check cost 19% of an insert
 
@@ -93,10 +134,21 @@ is holding into the key buffer would be invalidated.
 ## 4. Values sit in a `List`, keys do not
 
 The keys avoid a per-entry allocation; the values do not avoid a `List`. That
-is fine in itself, but it means a map owns four growable regions that grow
-independently -- keys, key offsets, values, and the slot table. Holding them in
-one allocation, the way `mm_fiby_tree` and `mm_lcrs_tree` do, would cut the
-allocation count per map and shrink the handle.
+is fine in itself, but it means a map owns six allocations that grow
+independently -- keys, key offsets, values, slot indices, control bytes and the
+tombstone mask.
+
+Item 1 covers what merging them is and is not worth. The short version: it buys
+back part of a 269.6 ns constructor and nothing per insert, and deferring the
+allocations entirely buys back more of it than merging does.
+
+One part of the merge does stand on its own, though, and is not about
+allocation count: the end offset and the value for an entry are written on
+every insert and read together whenever a lookup returns a value, and they sit
+in two separate arrays. Interleaving them into a single entry array would put
+both on one cache line. That is a locality change rather than an allocator one,
+and unlike the rest of the merge it could plausibly move the steady-state
+number.
 
 ## 5. Smaller items
 
