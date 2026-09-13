@@ -133,16 +133,49 @@ for a map that receives even one insert, while a cheaper constructor helps
 every one of them. Per-document counting went from losing to the stdlib `Dict`
 at 20 words to winning by 16%, and by 15% at 100 words.
 
-**Still open:** the entry family (`keys_end`, `entry_hashes`, `deleted_mask`,
-the values) could merge too, but only after its members share one growth
-schedule, which today they do not. Worth roughly another 37 ns per map plus a
-reallocation per growth step, and the values need raw storage rather than a
-`List` to take part, which means moving and destroying `V` by hand.
+**The entry family is merged too.** `keys_end` stays where it is, inside
+`KeysContainer`, which is a standalone type with its own lifecycle. The other
+three -- the cached hashes, the values and the tombstone mask -- now share one
+block with a single `entry_capacity`. That meant giving up `List[V]` for raw
+storage: growth moves the values with `unsafe_uninit_move_n`, the destructor
+runs `unsafe_destroy_n` over every entry ever added (deleted ones included,
+since entries are never renumbered), and the copy constructor copies them one
+by one while the hashes and mask go by `memcpy`.
 
-The most promising piece is still not about allocation count: `keys_end[i]` and
-`values[i]` are written on the same insert and read together on any lookup
-returning a value, from two separate arrays. Interleaving those two puts both
-on one cache line.
+The block is allocated as `UInt64` rather than as bytes, which is what gives
+the hash region its 8-byte alignment: the installed `Layout` has no
+explicit-alignment constructor, and a byte allocation promises nothing. Values
+follow at a multiple of 8, so any `V` aligned to 8 or less is satisfied, and a
+`comptime assert` rejects the rest.
+
+Four allocations per map now, from seven at the start:
+
+| | 7 allocs | 5 allocs | 4 allocs |
+| --- | --- | --- | --- |
+| construct + destruct, empty | 269.6 ns | 188.2 ns | **170.0 ns** |
+| per-document count, 5-word docs | 337 ns | 255 ns | **209 ns** |
+| per-document count, 20-word docs | 839 ns | 699 ns | **623 ns** |
+| per-document count, 100-word docs | 2756 ns | 2429 ns | **2208 ns** |
+| index the english corpus | 15.0 us | 15.0 us | **13.0 us** |
+| insert, pre-sized | 11.0 ns | 11.0 ns | **10.0 ns** |
+| put, steady state | 11.3 ns | 11.3 ns | **10.5 ns** |
+
+The second merge did what the first one could not: it moved the *insert* path,
+not just the constructor. A pre-sized insert is now 10.0 ns against the stdlib
+`Dict`'s 11.2, having been behind, and corpus builds came down 8-13%. Three
+separate capacity checks per insert -- the values `List`, the mask, the hash
+array -- became one, and the three regions an insert writes now sit in one
+allocation instead of three.
+
+Against the stdlib `Dict`, per-document counting went from losing at every size
+to level at 5 words and 25% ahead at 20 and above, and whole-corpus word
+counting now wins on ten of the twelve corpora, english by 84%.
+
+**Still open:** `keys_end` could join the entry block, but only by dissolving
+`KeysContainer` as a standalone type. And the locality idea is unchanged and
+still untried: `keys_end[i]` and `values[i]` are written on the same insert and
+read together on any lookup returning a value, and interleaving those two would
+put both on one cache line.
 
 ### Killed by measurement: dropping a redundant zero-fill
 

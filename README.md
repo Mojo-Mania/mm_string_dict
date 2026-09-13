@@ -193,9 +193,9 @@ much of that difference is `_rehash` recomputing a hash for every entry it moves
 where the stdlib reuses a stored one.
 
 Small maps are a different story, and a good one. One map per document — the
-shape of a term-frequency or grouping pass — runs **699 ns per 20-word document
-against the stdlib's 834**, 16% ahead, and holds that margin at 100 words. An
-empty map costs 188 ns to build and tear down, five allocations' worth.
+shape of a term-frequency or grouping pass — runs **623 ns per 20-word document
+against the stdlib's 831**, 25% ahead, and holds that margin at 100 words. An
+empty map costs 170 ns to build and tear down, four allocations' worth.
 
 Two switches address the growth cost. If you know the size up front,
 `StringDict[Int](capacity=n)` removes the growth entirely. Otherwise
@@ -260,7 +260,7 @@ control byte replaced the cached hash.
 ## Development
 
 ```bash
-pixi run test     # the test suite (54 tests)
+pixi run test     # the test suite (55 tests)
 pixi run bench    # the benchmarks above
 pixi run bench-destructive      # the destructive=True variant, alone
 pixi run bench-non-destructive  # the destructive=False variant, alone

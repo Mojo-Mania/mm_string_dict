@@ -803,5 +803,46 @@ def test_narrow_key_count_type_is_correct_up_to_its_cap() raises:
     assert_equal(dict.get("k7", -1), 7000)
 
 
+def test_owning_values_survive_growth_copy_and_clear() raises:
+    """Values that own heap memory, driven through every path that moves them.
+
+    The values live in a raw region rather than a `List`, so growth moves them
+    with `unsafe_uninit_move_n` and the destructor runs `unsafe_destroy_n` by
+    hand. A `String` value makes a mistake in either one visible: a double move
+    corrupts, a missed destroy leaks. Run under `leaks --atExit` to see the
+    second kind.
+    """
+    var dict = StringDict[String]()
+    for i in range(5000):  # several reallocations of the entry block
+        dict[String("key-", i)] = String("value-", i, "-", "x" * (i % 40))
+
+    assert_equal(len(dict), 5000)
+    for i in range(0, 5000, 97):
+        assert_equal(
+            dict.get(String("key-", i), ""),
+            String("value-", i, "-", "x" * (i % 40)),
+        )
+
+    # Deleted entries keep their values until the map dies, so the destructor
+    # has to destroy those too.
+    for i in range(0, 5000, 3):
+        dict.delete(String("key-", i))
+    assert_equal(len(dict), 5000 - ((5000 + 2) // 3))
+
+    var duplicate = dict.copy()
+    for i in range(5000, 7000):  # grow the original past the copy
+        dict[String("key-", i)] = String("late-", i)
+    assert_equal(duplicate.get("key-1", ""), "value-1-x")
+    assert_equal(dict.get("key-6000", ""), "late-6000")
+
+    var moved = duplicate^
+    assert_equal(moved.get("key-2", ""), String("value-2-", "xx"))
+
+    dict.clear()
+    assert_equal(len(dict), 0)
+    dict["after"] = "clear"
+    assert_equal(dict.get("after", ""), "clear")
+
+
 def main() raises:
     TestSuite.discover_tests[__functions_in_module()]().run()

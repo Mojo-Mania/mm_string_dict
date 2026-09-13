@@ -57,11 +57,8 @@ def footprint(map: Map) -> Int:
     total += map._keys.capacity * OFFSET  # end offsets
     total += map.capacity + GROUP  # control bytes plus mirror
     total += map.capacity * INDEX  # slot -> entry index
-    total += map._values.capacity() * size_of[Int]()  # values
-    comptime if Map.caching_hashes:
-        total += map.capacity * INDEX
-    comptime if Map.destructive:
-        total += map.deleted_bytes  # tombstone mask
+    # Values, cached hashes and the tombstone mask share one entry block.
+    total += Map._entry_words(map.entry_capacity) * size_of[UInt64]()
     return total
 
 
@@ -86,7 +83,7 @@ def bench_corpora() raises:
         var map = build(words)
         var mask = 0
         comptime if Map.destructive:
-            mask = map.deleted_bytes
+            mask = (map.entry_capacity + 7) >> 3
         print(
             "  ",
             pad(name, 12),
@@ -179,7 +176,7 @@ def bench_at_scale() raises:
     print("   miss           ", fmt(measure(miss) / Float64(PROBES)), "ns")
     print("   footprint      ", footprint(map), "bytes")
     comptime if Map.destructive:
-        print("   tombstone mask ", map.deleted_bytes, "bytes")
+        print("   tombstone mask ", (map.entry_capacity + 7) >> 3, "bytes")
 
 
 def main() raises:

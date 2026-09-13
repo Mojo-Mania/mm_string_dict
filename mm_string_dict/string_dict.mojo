@@ -25,8 +25,13 @@ Four compile-time parameters trade memory for capability; see `StringDict`.
 from std.bit import bit_width, pop_count
 from std.memory import unsafe_memcpy, unsafe_memset, unsafe_memset_zero
 from std.os import abort
+from std.memory import (
+    unsafe_destroy_n,
+    unsafe_uninit_copy_n,
+    unsafe_uninit_move_n,
+)
 from std.memory.alloc import Allocation, alloc, dealloc
-from std.sys.info import simd_width_of, size_of
+from std.sys.info import align_of, simd_width_of, size_of
 
 
 comptime GROUP = simd_width_of[DType.uint8]()
@@ -57,6 +62,39 @@ an insert may reuse it."""
 
 
 comptime _MIN_KEYS = 8
+
+
+@always_inline
+def _entry_block[
+    V: AnyType, caching_hashes: Bool, destructive: Bool
+](capacity: Int) -> Tuple[Int, Int, Int]:
+    """Byte offsets of the value and mask regions, and the block's total size.
+
+    The three entry-indexed regions share one allocation. Hashes go first, at
+    offset zero, so their 8-byte alignment comes free from the block's own;
+    their region is a whole number of 8-byte words, so the values that follow
+    land on an offset the allocator's alignment already satisfies.
+
+    Parameters:
+        V: The value type.
+        caching_hashes: Whether a hash region is present.
+        destructive: Whether a tombstone mask is present.
+
+    Args:
+        capacity: The number of entries the block must hold.
+
+    Returns:
+        The value offset, the mask offset, and the total size in bytes.
+    """
+    var values = 0
+    comptime if caching_hashes:
+        values = capacity * size_of[UInt64]()
+    var mask = values + capacity * size_of[V]()
+    var total = mask
+    comptime if destructive:
+        total += (capacity + 7) >> 3
+    # An allocation of nothing is still a pointer that must be free-able.
+    return (values, mask, total if total > 0 else 1)
 
 
 @always_inline
@@ -343,22 +381,24 @@ struct StringDict[
     """One byte per slot: `_EMPTY`, `_DELETED`, or the top seven bits of the
     key's hash. `GROUP` of them are compared at once, and the first `GROUP`
     bytes are mirrored past the end so a load near the end stays in bounds."""
+    var entries: Pointer[UInt8, MutUntrackedOrigin]
+    """One allocation holding every entry-indexed region: the cached hashes,
+    the values, and the tombstone mask. They are indexed by entry rather than
+    by slot, and so grow together, on a schedule of their own -- reusing a
+    deleted slot still appends an entry, so under churn entries outnumber
+    slots."""
+    var entry_capacity: Int
+    """Entries the block has room for, shared by all three regions."""
     var entry_hashes: Pointer[UInt64, MutUntrackedOrigin]
     """Each key's full hash, indexed by entry rather than by slot, when
     `caching_hashes` is on. Keyed by entry it survives a rehash, which is what
     lets the rehash reuse it; keyed by slot it would not."""
-    var hash_capacity: Int
-    """How many hashes `entry_hashes` has room for."""
-    var _values: List[Self.V]
+    var _values: Pointer[Self.V, MutUntrackedOrigin]
     """The values, in insertion order, parallel to the keys."""
     var slot_to_index: Pointer[Scalar[Self.KeyCountType], MutUntrackedOrigin]
     """One-based key index per slot; zero means the slot is empty."""
     var deleted_mask: Pointer[UInt8, MutUntrackedOrigin]
     """One bit per entry marking it deleted, when `destructive` is on."""
-    var deleted_bytes: Int
-    """Bytes allocated for `deleted_mask`. It is indexed by entry, not by slot:
-    reusing a deleted slot still appends a new entry, so entries outgrow the
-    table and the mask has to track them, not it."""
     var count: Int
     """How many live entries the map holds."""
     var occupied: Int
@@ -400,29 +440,14 @@ struct StringDict[
         ).unsafe_bitcast[UInt8]()
         unsafe_memset_zero(self.slot_to_index, self.capacity)
         unsafe_memset(self.control, _EMPTY, self.capacity + GROUP)
-        comptime if Self.caching_hashes:
-            self.hash_capacity = self._keys.capacity
-            self.entry_hashes = alloc[UInt64](
-                {count = self.hash_capacity}
-            ).unsafe_leak()
-        else:
-            # Not allocated when off: a zero-count allocation is still a
-            # round trip through the allocator. The field must hold something
-            # (`Pointer` is non-nullable), so it aliases the slot block;
-            # `hash_capacity == 0` marks it as never to be read or freed.
-            self.hash_capacity = 0
-            self.entry_hashes = self.slot_to_index.unsafe_bitcast[UInt64]()
-        self._values = List[Self.V](capacity=capacity)
-
-        comptime if Self.destructive:
-            self.deleted_bytes = self.capacity >> 3
-            self.deleted_mask = alloc[UInt8](
-                {count = self.deleted_bytes}
-            ).unsafe_leak()
-            unsafe_memset_zero(self.deleted_mask, self.deleted_bytes)
-        else:
-            self.deleted_bytes = 0
-            self.deleted_mask = self.slot_to_index.unsafe_bitcast[UInt8]()
+        self.entry_capacity = self._keys.capacity
+        self.entries = Self._alloc_entries(self.entry_capacity)
+        # Placeholders; `_bind_entries` sets all three from `entries`.
+        self.entry_hashes = self.entries.unsafe_bitcast[UInt64]()
+        self._values = self.entries.unsafe_bitcast[Self.V]()
+        self.deleted_mask = self.entries
+        self._bind_entries()
+        self._clear_mask(0)
 
     def __init__(out self, *, copy: Self):
         """Constructs an independent copy.
@@ -446,38 +471,29 @@ struct StringDict[
         self.control = self.slot_to_index.unsafe_offset(
             self.capacity
         ).unsafe_bitcast[UInt8]()
+        self.entry_capacity = copy.entry_capacity
+        self.entries = Self._alloc_entries(self.entry_capacity)
+        self.entry_hashes = self.entries.unsafe_bitcast[UInt64]()
+        self._values = self.entries.unsafe_bitcast[Self.V]()
+        self.deleted_mask = self.entries
+        self._bind_entries()
+        # The hashes and the mask are plain bytes, but the values are `V` and
+        # may own memory, so they are copied one by one rather than memcpy'd.
+        unsafe_uninit_copy_n[overlapping=False](
+            dest=self._values, src=copy._values, count=copy._keys.count
+        )
         comptime if Self.caching_hashes:
-            self.hash_capacity = copy.hash_capacity
-            self.entry_hashes = alloc[UInt64](
-                {count = self.hash_capacity}
-            ).unsafe_leak()
             unsafe_memcpy(
                 dest=self.entry_hashes,
                 src=copy.entry_hashes,
-                count=self.hash_capacity,
+                count=copy._keys.count,
             )
-        else:
-            # Not allocated when off: a zero-count allocation is still a
-            # round trip through the allocator. The field must hold something
-            # (`Pointer` is non-nullable), so it aliases the slot block;
-            # `hash_capacity == 0` marks it as never to be read or freed.
-            self.hash_capacity = 0
-            self.entry_hashes = self.slot_to_index.unsafe_bitcast[UInt64]()
-        self._values = copy._values.copy()
-
         comptime if Self.destructive:
-            self.deleted_bytes = copy.deleted_bytes
-            self.deleted_mask = alloc[UInt8](
-                {count = self.deleted_bytes}
-            ).unsafe_leak()
             unsafe_memcpy(
                 dest=self.deleted_mask,
                 src=copy.deleted_mask,
-                count=self.deleted_bytes,
+                count=(self.entry_capacity + 7) >> 3,
             )
-        else:
-            self.deleted_bytes = 0
-            self.deleted_mask = self.slot_to_index.unsafe_bitcast[UInt8]()
 
     def __init__(out self, *, deinit move: Self):
         """Takes over `move`'s storage.
@@ -487,15 +503,92 @@ struct StringDict[
         """
         self._keys = move._keys^
         self.control = move.control
+        self.entries = move.entries
+        self.entry_capacity = move.entry_capacity
         self.entry_hashes = move.entry_hashes
-        self.hash_capacity = move.hash_capacity
-        self._values = move._values^
+        self._values = move._values
         self.slot_to_index = move.slot_to_index
         self.deleted_mask = move.deleted_mask
-        self.deleted_bytes = move.deleted_bytes
         self.count = move.count
         self.occupied = move.occupied
         self.capacity = move.capacity
+
+    @staticmethod
+    @always_inline
+    def _entry_words(capacity: Int) -> Int:
+        """The entry block's size for `capacity` entries, in 8-byte words.
+
+        The block is allocated as `UInt64` rather than as bytes, which is what
+        gives the hash region its 8-byte alignment; the values that follow sit
+        at a multiple of 8 and so are aligned for any `V` the constraint below
+        admits.
+
+        Args:
+            capacity: The number of entries the block must hold.
+
+        Returns:
+            The number of `UInt64` words to allocate.
+        """
+        comptime assert align_of[Self.V]() <= align_of[UInt64](), (
+            "StringDict values must not need more than 8-byte alignment; the"
+            " entry block is a word array"
+        )
+        var block = _entry_block[Self.V, Self.caching_hashes, Self.destructive](
+            capacity
+        )
+        return (block[2] + 7) >> 3
+
+    @staticmethod
+    @always_inline
+    def _alloc_entries(capacity: Int) -> Pointer[UInt8, MutUntrackedOrigin]:
+        """Allocates one block for every entry-indexed region.
+
+        Args:
+            capacity: The number of entries the block must hold.
+
+        Returns:
+            The block's base pointer.
+        """
+        return (
+            alloc[UInt64]({count = Self._entry_words(capacity)})
+            .unsafe_leak()
+            .unsafe_bitcast[UInt8]()
+        )
+
+    @always_inline
+    def _bind_entries(mut self):
+        """Points the three region fields into `entries`.
+
+        Called after every allocation of the block. The regions are kept as
+        fields rather than recomputed per access, for the same reason the probe
+        loop hoists its pointers: they all derive from one allocation, so the
+        compiler cannot prove a store through one misses a load through
+        another, and would reload the offsets on every use.
+        """
+        var block = _entry_block[Self.V, Self.caching_hashes, Self.destructive](
+            self.entry_capacity
+        )
+        self.entry_hashes = self.entries.unsafe_bitcast[UInt64]()
+        self._values = self.entries.unsafe_offset(block[0]).unsafe_bitcast[
+            Self.V
+        ]()
+        self.deleted_mask = self.entries.unsafe_offset(block[1])
+
+    @always_inline
+    def _clear_mask(mut self, first: Int):
+        """Zeroes the tombstone bits for entries from `first` on.
+
+        Args:
+            first: The first entry index whose bit must be cleared.
+        """
+        comptime if Self.destructive:
+            var from_byte = first >> 3
+            var to_byte = (self.entry_capacity + 7) >> 3
+            if to_byte > from_byte:
+                unsafe_memset_zero(
+                    self.deleted_mask.unsafe_offset(from_byte),
+                    to_byte - from_byte,
+                )
 
     def __deinit__(deinit self):
         """Releases the slot array and the optional side tables."""
@@ -507,21 +600,16 @@ struct StringDict[
                 },
             )
         )
-        comptime if Self.destructive:
-            dealloc(
-                Allocation(
-                    unsafe_owned_ptr=self.deleted_mask,
-                    layout={count = self.deleted_bytes},
-                )
+        # Every entry ever added still owns its value, deleted ones included:
+        # entries are never renumbered, so a deleted entry's value lives until
+        # the map does.
+        unsafe_destroy_n(self._values, self._keys.count)
+        dealloc(
+            Allocation(
+                unsafe_owned_ptr=self.entries.unsafe_bitcast[UInt64](),
+                layout={count = Self._entry_words(self.entry_capacity)},
             )
-
-        comptime if Self.caching_hashes:
-            dealloc(
-                Allocation(
-                    unsafe_owned_ptr=self.entry_hashes,
-                    layout={count = self.hash_capacity},
-                )
-            )
+        )
 
     def __len__(self) -> Int:
         """Returns how many live entries the map holds.
@@ -578,7 +666,7 @@ struct StringDict[
         """
         var key_index = self._find_key_index(key)
         if key_index != 0:
-            return self._values[key_index - 1].copy()
+            return self._values[unsafe_offset=key_index - 1].copy()
         raise Error("KeyError: ", key)
 
     def __setitem__(mut self, key: StringSlice, value: Self.V):
@@ -602,7 +690,7 @@ struct StringDict[
         """
         var key_index = self._find_key_index(key)
         if key_index != 0:
-            return self._values[key_index - 1].copy()
+            return self._values[unsafe_offset=key_index - 1].copy()
         self.put(key, default)
         return default.copy()
 
@@ -628,7 +716,7 @@ struct StringDict[
             if slot == -1:
                 raise Error("KeyError: ", key)
             var key_index = Int(self.slot_to_index.unsafe_load(slot))
-            var value = self._values[key_index - 1].copy()
+            var value = self._values[unsafe_offset=key_index - 1].copy()
             self._remove_at(slot)
             return value^
 
@@ -649,7 +737,7 @@ struct StringDict[
             if slot == -1:
                 return default.copy()
             var key_index = Int(self.slot_to_index.unsafe_load(slot))
-            var value = self._values[key_index - 1].copy()
+            var value = self._values[unsafe_offset=key_index - 1].copy()
             self._remove_at(slot)
             return value^
 
@@ -663,7 +751,7 @@ struct StringDict[
             comptime if Self.destructive:
                 if other._is_deleted(index):
                     continue
-            self.put(other._keys[index], other._values[index])
+            self.put(other._keys[index], other._values[unsafe_offset=index])
 
     def keys(
         ref self,
@@ -786,7 +874,7 @@ struct StringDict[
                     var candidate = (slot + lane) & mask
                     var key_index = Int(slot_to_index.unsafe_load(candidate))
                     if self._matches(candidate, key_index, key, key_hash):
-                        self._values[key_index - 1] = value.copy()
+                        self._values[unsafe_offset=key_index - 1] = value.copy()
                         return
                     matches[lane] = False
 
@@ -837,11 +925,11 @@ struct StringDict[
                     )
                 )
         self._keys.add(key)
-        self._values.append(value.copy())
-        self._reserve_deleted_bit(self._keys.count - 1)
+        var index = self._keys.count - 1
+        self._reserve_entry(index)
+        self._values.unsafe_offset(index).unsafe_write(value.copy())
         comptime if Self.caching_hashes:
-            self._reserve_entry_hash(self._keys.count - 1)
-            self.entry_hashes.unsafe_store(self._keys.count - 1, key_hash)
+            self.entry_hashes.unsafe_store(index, key_hash)
         self.count += 1
         if self.control[unsafe_offset=reusable] == _EMPTY:
             self.occupied += 1
@@ -917,93 +1005,68 @@ struct StringDict[
             self.count -= 1
 
     @always_inline
-    def _reserve_deleted_bit(mut self, index: Int):
-        """Makes sure the tombstone mask covers entry `index`.
+    def _reserve_entry(mut self, index: Int):
+        """Makes sure every entry region has room for entry `index`.
 
-        Only the bounds check is inlined here. The reallocation behind it runs
-        once per doubling, but leaving it in this body made the whole thing
-        `@no_inline`, so every insert paid for a call just to learn the mask
-        was already big enough -- about 19% of the cost of an insert.
-
-        Args:
-            index: The entry index that must have a bit in the mask.
-        """
-        comptime if Self.destructive:
-            if index >> 3 >= self.deleted_bytes:
-                self._grow_deleted_mask(index)
-
-    @always_inline
-    def _reserve_entry_hash(mut self, index: Int):
-        """Makes sure `entry_hashes` has room for entry `index`.
-
-        Only the bounds check is inlined, for the reason given on
-        `_reserve_deleted_bit`.
+        One bounds check now covers the hashes, the values and the tombstone
+        mask, where each used to check and grow separately. Only the check is
+        inlined; the reallocation behind it runs once per doubling, and leaving
+        it in this body made the whole thing `@no_inline`, so every insert paid
+        for a call just to learn there was room -- about 19% of an insert.
 
         Args:
-            index: The entry index that must have a slot in the array.
+            index: The entry index that must fit.
         """
+        if index >= self.entry_capacity:
+            self._grow_entries(index)
+
+    @no_inline
+    def _grow_entries(mut self, index: Int):
+        """Moves every entry region into a larger block.
+
+        Args:
+            index: The entry index that must fit.
+        """
+        var old_capacity = self.entry_capacity
+        var old_entries = self.entries
+        var old_values = self._values
+        var old_hashes = self.entry_hashes
+        var old_mask = self.deleted_mask
+
+        var grown = old_capacity
+        while grown <= index:
+            grown += grown if grown > 0 else 1
+        # The keys container holds end offsets for this many entries already;
+        # matching it keeps the two from reallocating on separate schedules.
+        if self._keys.capacity > grown:
+            grown = self._keys.capacity
+
+        self.entry_capacity = grown
+        self.entries = Self._alloc_entries(grown)
+        self._bind_entries()
+
+        # Values may own memory, so they are moved rather than copied; the
+        # hashes and the mask are plain bytes.
+        unsafe_uninit_move_n[overlapping=False](
+            dest=self._values, src=old_values, count=self._keys.count
+        )
         comptime if Self.caching_hashes:
-            if index >= self.hash_capacity:
-                self._grow_entry_hashes(index)
+            unsafe_memcpy(
+                dest=self.entry_hashes,
+                src=old_hashes,
+                count=self._keys.count,
+            )
+        comptime if Self.destructive:
+            var carried = (old_capacity + 7) >> 3
+            unsafe_memcpy(dest=self.deleted_mask, src=old_mask, count=carried)
+            self._clear_mask(carried << 3)
 
-    @no_inline
-    def _grow_entry_hashes(mut self, index: Int):
-        """Grows `entry_hashes` to cover entry `index`.
-
-        Args:
-            index: The entry index that must have a slot in the array.
-        """
-        var grown_to = self.hash_capacity
-        while grown_to <= index:
-            grown_to += grown_to if grown_to > 0 else 1
-        # As with the tombstone mask, matching the keys container's entry
-        # capacity keeps the two from reallocating on separate schedules.
-        if self._keys.capacity > grown_to:
-            grown_to = self._keys.capacity
-        var grown = alloc[UInt64]({count = grown_to}).unsafe_leak()
-        unsafe_memcpy(
-            dest=grown, src=self.entry_hashes, count=self.hash_capacity
-        )
         dealloc(
             Allocation(
-                unsafe_owned_ptr=self.entry_hashes,
-                layout={count = self.hash_capacity},
+                unsafe_owned_ptr=old_entries.unsafe_bitcast[UInt64](),
+                layout={count = Self._entry_words(old_capacity)},
             )
         )
-        self.entry_hashes = grown
-        self.hash_capacity = grown_to
-
-    @no_inline
-    def _grow_deleted_mask(mut self, index: Int):
-        """Doubles the tombstone mask until it covers entry `index`.
-
-        Args:
-            index: The entry index that must have a bit in the mask.
-        """
-        var needed = (index >> 3) + 1
-        var bytes = self.deleted_bytes
-        while bytes < needed:
-            bytes += bytes if bytes > 0 else 1
-        # The keys container already holds end offsets for this many entries,
-        # so sizing the mask to match makes the two grow at the same moments.
-        # Left to double on its own from one byte, the mask reallocated four
-        # times while building a map of 200 keys.
-        var paired = (self._keys.capacity + 7) >> 3
-        if paired > bytes:
-            bytes = paired
-        var grown = alloc[UInt8]({count = bytes}).unsafe_leak()
-        unsafe_memset_zero(grown, bytes)
-        unsafe_memcpy(
-            dest=grown, src=self.deleted_mask, count=self.deleted_bytes
-        )
-        dealloc(
-            Allocation(
-                unsafe_owned_ptr=self.deleted_mask,
-                layout={count = self.deleted_bytes},
-            )
-        )
-        self.deleted_mask = grown
-        self.deleted_bytes = bytes
 
     @always_inline
     def _is_deleted(self, index: Int) -> Bool:
@@ -1109,7 +1172,7 @@ struct StringDict[
         var key_index = self._find_key_index(key)
         if key_index == 0:
             return default.copy()
-        return self._values[key_index - 1].copy()
+        return self._values[unsafe_offset=key_index - 1].copy()
 
     def delete(mut self, key: StringSlice):
         """Removes `key`, if `destructive` is on and the key is present.
@@ -1147,20 +1210,18 @@ struct StringDict[
             var value = update(None)
             self.put(key, value)
         else:
-            self._values[key_index - 1] = update(
-                self._values[key_index - 1].copy()
+            self._values[unsafe_offset=key_index - 1] = update(
+                self._values[unsafe_offset=key_index - 1].copy()
             )
 
     def clear(mut self):
         """Removes every entry, keeping the allocated storage."""
-        self._values.clear()
+        unsafe_destroy_n(self._values, self._keys.count)
         self._keys.clear()
         unsafe_memset_zero(self.slot_to_index, self.capacity)
         unsafe_memset(self.control, _EMPTY, self.capacity + GROUP)
         self.occupied = 0
-
-        comptime if Self.destructive:
-            unsafe_memset_zero(self.deleted_mask, self.deleted_bytes)
+        self._clear_mask(0)
         self.count = 0
 
     @always_inline
@@ -1420,13 +1481,16 @@ struct _ValuesIter[
             raise StopIteration()
         var index = self._index
         self._index = self._src[]._next_live(index + 1)
-        # `List.__getitem__` vends an interior origin, which cannot widen to
-        # the whole-map origin an iterator's references need.
-        return (
-            self._src[]
-            ._values.unsafe_ptr()
-            .unsafe_origin_cast[Self.origin]()[unsafe_offset=index]
-        )
+        # The value region is held as a raw pointer with an untracked origin,
+        # so its mutability is fixed while `Self.origin`'s is a parameter.
+        # Re-origin it through a `Span`, which carries the origin the iterator
+        # promises and hands back references in it.
+        return Span[Self.V, Self.origin](
+            unsafe_ptr=self._src[]
+            ._values.unsafe_mut_cast[Self.origin.mut]()
+            .unsafe_origin_cast[Self.origin](),
+            length=index + 1,
+        )[index]
 
 
 struct _ItemsIter[
@@ -1520,5 +1584,5 @@ struct _ItemsIter[
             )
         )
         return Entry[Self.V, ImmOrigin(Self.origin)](
-            key, self._src[]._values[index].copy()
+            key, self._src[]._values[unsafe_offset=index].copy()
         )
