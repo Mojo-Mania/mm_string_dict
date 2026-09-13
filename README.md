@@ -192,7 +192,12 @@ table growth, which costs 12.3 ns per insert here against the stdlib's 9.0, and
 much of that difference is `_rehash` recomputing a hash for every entry it moves
 where the stdlib reuses a stored one.
 
-Two switches address it. If you know the size up front,
+Small maps are a different story, and a good one. One map per document — the
+shape of a term-frequency or grouping pass — runs **699 ns per 20-word document
+against the stdlib's 834**, 16% ahead, and holds that margin at 100 words. An
+empty map costs 188 ns to build and tear down, five allocations' worth.
+
+Two switches address the growth cost. If you know the size up front,
 `StringDict[Int](capacity=n)` removes the growth entirely. Otherwise
 `caching_hashes` stores each key's full hash by entry so a rehash reuses it,
 taking growth to 10.9 ns and halving the gap — at 8 bytes per entry, which is

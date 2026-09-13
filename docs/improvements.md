@@ -69,12 +69,10 @@ It stays off by default. 8 bytes per entry measured 19-34% of a whole map on
 the corpora, and a 4-7% build gain does not buy that in a container chosen for
 footprint. It is the right switch for an insert-heavy map that grows.
 
-### Fewer allocations, the way the trees do it
+### Done, partly: fewer allocations, the way the trees do it
 
-`mm_fiby_tree` and `mm_lcrs_tree` hold all their index regions in one
-allocation. The obvious question is whether the six here can be one region,
-since they all grow. They cannot, because they are two families on different
-schedules:
+The six regions are two families on different schedules, so they cannot all be
+one block:
 
 | | sized by | grows | factor |
 | --- | --- | --- | --- |
@@ -82,35 +80,69 @@ schedules:
 | `keys`, `keys_end` | key bytes, entry count | in `KeysContainer.add` | 1.5x |
 | `entry_hashes`, `deleted_mask` | entry count | on insert, paired to `_keys.capacity` | 2x |
 
-Measured on a build of 5000 keys, the two families track each other loosely
-but never coincide -- 8192 slots against an entry capacity of 4618, 2048
-against 913. Under churn they diverge outright, since entries are never
-renumbered and a rehash drops tombstones: inserting 20000 keys and deleting
-every other one ends with 16384 slots and an entry capacity of 23377, the
-entry side larger than the slot side.
+Building 5000 keys the families track loosely and never coincide -- 8192 slots
+against an entry capacity of 4618, 2048 against 913. Under churn they diverge
+outright: 20000 inserts with every other key deleted ends at 16384 slots
+against an entry capacity of 23377, the entry side the larger, because entries
+are never renumbered while a rehash drops tombstones.
 
-So a merge is two regions, not one:
+**The slot family is a true merge, and it is done.** `control` and
+`slot_to_index` are both exactly `capacity` long and always reallocated
+together, so they share one block: indices first, being the more strictly
+aligned, control bytes after. The zero-count allocations for switched-off
+features are gone too -- `alloc({count = 0})` is still a full round trip
+through the allocator -- so with `caching_hashes` off the map no longer pays
+for an `entry_hashes` array it will never read.
 
-- **The slot family is a true merge.** `control` and `slot_to_index` are both
-  exactly `capacity` long and are always reallocated together in `_rehash`.
-- **The entry family could be merged**, but only by first putting its members
-  on one shared growth schedule, which today they do not share.
+Seven allocations per map became five:
 
-What it is worth is the harder question, and the honest answer is: not much for
-speed. Every allocation-count change measured in this library so far has come
-out inside the noise, because growth allocates O(log n) times over a build.
-The measured prize is the **269.6 ns constructor** (six allocations against the
-stdlib `Dict`'s zero), which matters for programs holding many small maps. And
-even there, deferring allocation until the first insert removes more of it than
-merging six into three would.
+| | before | after |
+| --- | --- | --- |
+| construct + destruct, empty | 269.6 ns | 188.2 ns |
+| per-document word count, 5-word docs | 337 ns | 255 ns |
+| per-document word count, 20-word docs | 839 ns | 699 ns |
+| per-document word count, 100-word docs | 2756 ns | 2429 ns |
 
-There is one part of the entry family that is not about allocation count at
-all, and is the most promising piece: `keys_end[i]` and `values[i]` are written
-on the same insert and read together on any lookup that returns a value, from
-two separate arrays. Interleaving *those two* puts both on one cache line. That
-is a locality change, and unlike the rest it could move the steady-state
-number -- though note the steady-state number is already ahead of the stdlib
-(11.4 ns against 12.0), so the headroom is small.
+An allocation round trip costs about 37 ns here and is linear in the count, so
+the constructor was essentially just its allocations. Corpus builds and the
+insert path are unchanged.
+
+#### The merge cost 8-23% until the pointers were hoisted
+
+The first version of this regressed every corpus build -- english 15.0 to 16.2
+us, french 10.9 to 13.4, greek 10.6 to 12.5 -- consistently and far outside the
+3-5% run-to-run noise, while the small-map numbers improved. Two allocations
+that were provably distinct became one, and the compiler could no longer tell a
+store through `slot_to_index` from a load through `control`, so it reloaded
+both fields on every pass of the probe loop.
+
+Loading each pointer into a local once, at the top of `put`, `_find_slot` and
+`_rehash`, recovers all of it and leaves a few corpora slightly ahead of where
+they started. Worth remembering as a general consequence: merging allocations
+takes away alias information the hot loop was relying on, and the fix is to
+hoist, not to give up the merge.
+
+#### Why this matters here, and deferral does not
+
+The stdlib `Dict` defers allocation until its first insert because empty dicts
+are everywhere in ordinary Mojo. That reasoning does not carry over: a
+`StringDict` is reached for deliberately and is rarely empty. But it is often
+*small* -- one map per document is the shape of a term-frequency or grouping
+pass, which is exactly what this container is for -- and deferral does nothing
+for a map that receives even one insert, while a cheaper constructor helps
+every one of them. Per-document counting went from losing to the stdlib `Dict`
+at 20 words to winning by 16%, and by 15% at 100 words.
+
+**Still open:** the entry family (`keys_end`, `entry_hashes`, `deleted_mask`,
+the values) could merge too, but only after its members share one growth
+schedule, which today they do not. Worth roughly another 37 ns per map plus a
+reallocation per growth step, and the values need raw storage rather than a
+`List` to take part, which means moving and destroying `V` by hand.
+
+The most promising piece is still not about allocation count: `keys_end[i]` and
+`values[i]` are written on the same insert and read together on any lookup
+returning a value, from two separate arrays. Interleaving those two puts both
+on one cache line.
 
 ### Killed by measurement: dropping a redundant zero-fill
 

@@ -74,14 +74,10 @@ def bench_fixed_cost() raises:
     print("  ----------------------------------------------------")
     line("construct + destruct, empty", measure(ours), measure(theirs), "ns")
     print("")
-    print(
-        "   A `StringDict` makes six allocations in its constructor -- packed"
-    )
-    print(
-        "   keys, end offsets, cached hashes, slot indices, control bytes and"
-    )
-    print("   the tombstone mask. A `Dict` allocates nothing until its first")
-    print("   insert, which is the whole of the difference.")
+    print("   A `StringDict` allocates five times in its constructor -- packed")
+    print("   keys, end offsets, the slot block, the tombstone mask and the")
+    print("   values. A `Dict` allocates nothing until its first insert, which")
+    print("   is the whole of the difference.")
 
 
 def bench_steady_state() raises:

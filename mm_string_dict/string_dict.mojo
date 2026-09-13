@@ -57,6 +57,30 @@ an insert may reuse it."""
 
 
 comptime _MIN_KEYS = 8
+
+
+@always_inline
+def _slot_block_count[KeyCountType: DType](capacity: Int) -> Int:
+    """Elements of `KeyCountType` holding both slot regions at once.
+
+    `slot_to_index` and `control` are both exactly `capacity` long and are
+    always reallocated together -- the only two regions in the map that share a
+    growth schedule -- so they share an allocation. Indices come first, being
+    the more strictly aligned of the two.
+
+    Parameters:
+        KeyCountType: The element type of the index region.
+
+    Args:
+        capacity: The slot capacity the block must cover.
+
+    Returns:
+        The number of `KeyCountType` elements to allocate.
+    """
+    comptime INDEX = size_of[Scalar[KeyCountType]]()
+    return capacity + (capacity + GROUP + INDEX - 1) // INDEX
+
+
 # `put` checks the entry cap only for index types narrower than this. At 32
 # bits the cap is four billion entries, which no map that fits in memory can
 # reach, so wider types pay nothing for the check. Narrower ones are opt-in and
@@ -368,23 +392,27 @@ struct StringDict[
             )
         self._keys = KeysContainer[Self.KeyOffsetType](self.capacity)
 
+        self.slot_to_index = alloc[Scalar[Self.KeyCountType]](
+            {count = _slot_block_count[Self.KeyCountType](self.capacity)}
+        ).unsafe_leak()
+        self.control = self.slot_to_index.unsafe_offset(
+            self.capacity
+        ).unsafe_bitcast[UInt8]()
+        unsafe_memset_zero(self.slot_to_index, self.capacity)
+        unsafe_memset(self.control, _EMPTY, self.capacity + GROUP)
         comptime if Self.caching_hashes:
             self.hash_capacity = self._keys.capacity
             self.entry_hashes = alloc[UInt64](
                 {count = self.hash_capacity}
             ).unsafe_leak()
         else:
+            # Not allocated when off: a zero-count allocation is still a
+            # round trip through the allocator. The field must hold something
+            # (`Pointer` is non-nullable), so it aliases the slot block;
+            # `hash_capacity == 0` marks it as never to be read or freed.
             self.hash_capacity = 0
-            self.entry_hashes = alloc[UInt64]({count = 0}).unsafe_leak()
+            self.entry_hashes = self.slot_to_index.unsafe_bitcast[UInt64]()
         self._values = List[Self.V](capacity=capacity)
-        self.slot_to_index = alloc[Scalar[Self.KeyCountType]](
-            {count = self.capacity}
-        ).unsafe_leak()
-        unsafe_memset_zero(self.slot_to_index, self.capacity)
-        self.control = alloc[UInt8](
-            {count = self.capacity + GROUP}
-        ).unsafe_leak()
-        unsafe_memset(self.control, _EMPTY, self.capacity + GROUP)
 
         comptime if Self.destructive:
             self.deleted_bytes = self.capacity >> 3
@@ -394,7 +422,7 @@ struct StringDict[
             unsafe_memset_zero(self.deleted_mask, self.deleted_bytes)
         else:
             self.deleted_bytes = 0
-            self.deleted_mask = alloc[UInt8]({count = 0}).unsafe_leak()
+            self.deleted_mask = self.slot_to_index.unsafe_bitcast[UInt8]()
 
     def __init__(out self, *, copy: Self):
         """Constructs an independent copy.
@@ -406,13 +434,18 @@ struct StringDict[
         self.occupied = copy.occupied
         self.capacity = copy.capacity
         self._keys = copy._keys
-        self.control = alloc[UInt8](
-            {count = self.capacity + GROUP}
+
+        # One block holds both regions, so one memcpy duplicates them.
+        var block = _slot_block_count[Self.KeyCountType](self.capacity)
+        self.slot_to_index = alloc[Scalar[Self.KeyCountType]](
+            {count = block}
         ).unsafe_leak()
         unsafe_memcpy(
-            dest=self.control, src=copy.control, count=self.capacity + GROUP
+            dest=self.slot_to_index, src=copy.slot_to_index, count=block
         )
-
+        self.control = self.slot_to_index.unsafe_offset(
+            self.capacity
+        ).unsafe_bitcast[UInt8]()
         comptime if Self.caching_hashes:
             self.hash_capacity = copy.hash_capacity
             self.entry_hashes = alloc[UInt64](
@@ -424,17 +457,13 @@ struct StringDict[
                 count=self.hash_capacity,
             )
         else:
+            # Not allocated when off: a zero-count allocation is still a
+            # round trip through the allocator. The field must hold something
+            # (`Pointer` is non-nullable), so it aliases the slot block;
+            # `hash_capacity == 0` marks it as never to be read or freed.
             self.hash_capacity = 0
-            self.entry_hashes = alloc[UInt64]({count = 0}).unsafe_leak()
+            self.entry_hashes = self.slot_to_index.unsafe_bitcast[UInt64]()
         self._values = copy._values.copy()
-        self.slot_to_index = alloc[Scalar[Self.KeyCountType]](
-            {count = self.capacity}
-        ).unsafe_leak()
-        unsafe_memcpy(
-            dest=self.slot_to_index,
-            src=copy.slot_to_index,
-            count=self.capacity,
-        )
 
         comptime if Self.destructive:
             self.deleted_bytes = copy.deleted_bytes
@@ -448,7 +477,7 @@ struct StringDict[
             )
         else:
             self.deleted_bytes = 0
-            self.deleted_mask = alloc[UInt8]({count = 0}).unsafe_leak()
+            self.deleted_mask = self.slot_to_index.unsafe_bitcast[UInt8]()
 
     def __init__(out self, *, deinit move: Self):
         """Takes over `move`'s storage.
@@ -473,13 +502,9 @@ struct StringDict[
         dealloc(
             Allocation(
                 unsafe_owned_ptr=self.slot_to_index,
-                layout={count = self.capacity},
-            )
-        )
-        dealloc(
-            Allocation(
-                unsafe_owned_ptr=self.control,
-                layout={count = self.capacity + GROUP},
+                layout={
+                    count = _slot_block_count[Self.KeyCountType](self.capacity)
+                },
             )
         )
         comptime if Self.destructive:
@@ -489,18 +514,14 @@ struct StringDict[
                     layout={count = self.deleted_bytes},
                 )
             )
-        else:
+
+        comptime if Self.caching_hashes:
             dealloc(
                 Allocation(
-                    unsafe_owned_ptr=self.deleted_mask, layout={count = 0}
+                    unsafe_owned_ptr=self.entry_hashes,
+                    layout={count = self.hash_capacity},
                 )
             )
-        dealloc(
-            Allocation(
-                unsafe_owned_ptr=self.entry_hashes,
-                layout={count = self.hash_capacity},
-            )
-        )
 
     def __len__(self) -> Int:
         """Returns how many live entries the map holds.
@@ -744,11 +765,15 @@ struct StringDict[
         var tag = SIMD[DType.uint8, GROUP](Self._tag(key_hash))
         var slot = Int(key_hash & UInt64(mask))
         var reusable = -1
+        # Both regions live in one allocation now, so the compiler can no
+        # longer tell a store through one from a load through the other and
+        # would reload the fields on every pass. Loading each once, up front,
+        # is what keeps the probe loop reading from registers.
+        var control = self.control
+        var slot_to_index = self.slot_to_index
 
         while True:
-            var group = self.control.unsafe_offset(slot).unsafe_load[
-                width=GROUP
-            ]()
+            var group = control.unsafe_offset(slot).unsafe_load[width=GROUP]()
 
             # Does one of these slots already hold this key? Most groups hold
             # no candidate at all, and one reduce answers that.
@@ -759,9 +784,7 @@ struct StringDict[
                     if lane == GROUP:
                         break
                     var candidate = (slot + lane) & mask
-                    var key_index = Int(
-                        self.slot_to_index.unsafe_load(candidate)
-                    )
+                    var key_index = Int(slot_to_index.unsafe_load(candidate))
                     if self._matches(candidate, key_index, key, key_hash):
                         self._values[key_index - 1] = value.copy()
                         return
@@ -1027,12 +1050,12 @@ struct StringDict[
 
         self.capacity <<= 1
         self.slot_to_index = alloc[Scalar[Self.KeyCountType]](
-            {count = self.capacity}
+            {count = _slot_block_count[Self.KeyCountType](self.capacity)}
         ).unsafe_leak()
+        self.control = self.slot_to_index.unsafe_offset(
+            self.capacity
+        ).unsafe_bitcast[UInt8]()
         unsafe_memset_zero(self.slot_to_index, self.capacity)
-        self.control = alloc[UInt8](
-            {count = self.capacity + GROUP}
-        ).unsafe_leak()
         unsafe_memset(self.control, _EMPTY, self.capacity + GROUP)
 
         self.occupied = 0
@@ -1050,8 +1073,9 @@ struct StringDict[
             else:
                 key_hash = hash(self._keys[key_index - 1])
             var slot = Int(key_hash & UInt64(mask))
+            var control = self.control
             while True:
-                var group = self.control.unsafe_offset(slot).unsafe_load[
+                var group = control.unsafe_offset(slot).unsafe_load[
                     width=GROUP
                 ]()
                 var lane = Self._first_lane(
@@ -1065,14 +1089,10 @@ struct StringDict[
 
         dealloc(
             Allocation(
-                unsafe_owned_ptr=old_control,
-                layout={count = old_capacity + GROUP},
-            )
-        )
-        dealloc(
-            Allocation(
                 unsafe_owned_ptr=old_slot_to_index,
-                layout={count = old_capacity},
+                layout={
+                    count = _slot_block_count[Self.KeyCountType](old_capacity)
+                },
             )
         )
 
@@ -1154,10 +1174,14 @@ struct StringDict[
         var mask = self.capacity - 1
         var tag = SIMD[DType.uint8, GROUP](Self._tag(key_hash))
         var slot = Int(key_hash & UInt64(mask))
+        # Both regions live in one allocation now, so the compiler can no
+        # longer tell a store through one from a load through the other and
+        # would reload the fields on every pass. Loading each once, up front,
+        # is what keeps the probe loop reading from registers.
+        var control = self.control
+        var slot_to_index = self.slot_to_index
         while True:
-            var group = self.control.unsafe_offset(slot).unsafe_load[
-                width=GROUP
-            ]()
+            var group = control.unsafe_offset(slot).unsafe_load[width=GROUP]()
             var matches = group.eq(tag)
             if matches.reduce_or():
                 while True:
@@ -1165,9 +1189,7 @@ struct StringDict[
                     if lane == GROUP:
                         break
                     var candidate = (slot + lane) & mask
-                    var key_index = Int(
-                        self.slot_to_index.unsafe_load(candidate)
-                    )
+                    var key_index = Int(slot_to_index.unsafe_load(candidate))
                     if self._matches(candidate, key_index, key, key_hash):
                         return candidate
                     matches[lane] = False
