@@ -23,8 +23,36 @@ Four compile-time parameters trade memory for capability; see `StringDict`.
 """
 
 from std.bit import bit_width, pop_count
-from std.memory import unsafe_memcpy, unsafe_memset_zero
+from std.memory import unsafe_memcpy, unsafe_memset, unsafe_memset_zero
 from std.memory.alloc import Allocation, alloc, dealloc
+from std.sys.info import simd_width_of
+
+
+comptime GROUP = simd_width_of[DType.uint8]()
+"""How many slots one SIMD compare covers, chosen for the target: 16 with
+NEON, 32 with AVX2, 64 with AVX-512."""
+
+
+def _lane_indices() -> SIMD[DType.uint8, GROUP]:
+    """0, 1, 2, ... one per lane, for picking the lowest set lane.
+
+    Returns:
+        A vector of lane numbers.
+    """
+    var indices = SIMD[DType.uint8, GROUP](0)
+    comptime for lane in range(GROUP):
+        indices[lane] = UInt8(lane)
+    return indices
+
+
+comptime _LANE_INDICES = _lane_indices()
+"""Lane numbers, built once at compile time."""
+
+comptime _EMPTY: UInt8 = 0x80
+"""Control byte for a slot that has never held an entry. A probe stops here."""
+comptime _DELETED: UInt8 = 0xFE
+"""Control byte for a slot whose entry was deleted. A probe walks past it, and
+an insert may reuse it."""
 
 
 comptime _MIN_KEYS = 8
@@ -248,7 +276,7 @@ struct StringDict[
     KeyCountType: DType = .uint32,
     KeyOffsetType: DType = .uint32,
     destructive: Bool = True,
-    caching_hashes: Bool = True,
+    caching_hashes: Bool = False,
 ](Boolable, Copyable, Movable, Sized):
     """A hash map from string keys to `V`, with the keys packed end to end.
 
@@ -261,13 +289,22 @@ struct StringDict[
             caps the total size of all keys together.
         destructive: Whether `delete` is supported. It costs one bit per entry
             for the tombstone mask; with it off, `delete` does nothing.
-        caching_hashes: Whether to store each key's hash next to its slot. It
-            costs `KeyCountType` bytes per slot and saves rehashing the key on
-            every probe, which is worth it unless keys are very short.
+        caching_hashes: Whether to store each key's full hash beside its slot,
+            as a second filter after the control byte's seven bits. Off by
+            default: the tag already rejects 127 of every 128 non-matching
+            slots, so this buys a few percent on lookups and costs
+            `KeyCountType` bytes per slot -- and footprint is what this
+            container is for. Inserts measure the same either way. Turn it on
+            when keys are long and share prefixes, where a false positive
+            means an expensive comparison.
     """
 
     var _keys: KeysContainer[Self.KeyOffsetType]
     """The keys, packed end to end. Reachable through `key_storage()`."""
+    var control: Pointer[UInt8, MutUntrackedOrigin]
+    """One byte per slot: `_EMPTY`, `_DELETED`, or the top seven bits of the
+    key's hash. `GROUP` of them are compared at once, and the first `GROUP`
+    bytes are mirrored past the end so a load near the end stays in bounds."""
     var key_hashes: Pointer[Scalar[Self.KeyCountType], MutUntrackedOrigin]
     """Cached hash per slot, when `caching_hashes` is on."""
     var _values: List[Self.V]
@@ -276,8 +313,16 @@ struct StringDict[
     """One-based key index per slot; zero means the slot is empty."""
     var deleted_mask: Pointer[UInt8, MutUntrackedOrigin]
     """One bit per entry marking it deleted, when `destructive` is on."""
+    var deleted_bytes: Int
+    """Bytes allocated for `deleted_mask`. It is indexed by entry, not by slot:
+    reusing a deleted slot still appends a new entry, so entries outgrow the
+    table and the mask has to track them, not it."""
     var count: Int
     """How many live entries the map holds."""
+    var occupied: Int
+    """Slots that are not `_EMPTY`, deleted ones included. This is what the
+    growth check looks at: a deleted slot is not reusable by a probe that has
+    already walked past it, so it still costs the table room."""
     var capacity: Int
     """How many slots the table has. Always a power of two."""
 
@@ -295,8 +340,9 @@ struct StringDict[
             or Self.KeyCountType == .uint64
         ), "KeyCountType needs to be an unsigned integer"
         self.count = 0
-        if capacity <= 8:
-            self.capacity = 8
+        self.occupied = 0
+        if capacity <= GROUP:
+            self.capacity = GROUP
         else:
             var icapacity = Int64(capacity)
             self.capacity = capacity if pop_count(icapacity) == 1 else 1 << Int(
@@ -317,13 +363,19 @@ struct StringDict[
             {count = self.capacity}
         ).unsafe_leak()
         unsafe_memset_zero(self.slot_to_index, self.capacity)
+        self.control = alloc[UInt8](
+            {count = self.capacity + GROUP}
+        ).unsafe_leak()
+        unsafe_memset(self.control, _EMPTY, self.capacity + GROUP)
 
         comptime if Self.destructive:
+            self.deleted_bytes = self.capacity >> 3
             self.deleted_mask = alloc[UInt8](
-                {count = self.capacity >> 3}
+                {count = self.deleted_bytes}
             ).unsafe_leak()
-            unsafe_memset_zero(self.deleted_mask, self.capacity >> 3)
+            unsafe_memset_zero(self.deleted_mask, self.deleted_bytes)
         else:
+            self.deleted_bytes = 0
             self.deleted_mask = alloc[UInt8]({count = 0}).unsafe_leak()
 
     def __init__(out self, *, copy: Self):
@@ -333,8 +385,15 @@ struct StringDict[
             copy: The map to duplicate.
         """
         self.count = copy.count
+        self.occupied = copy.occupied
         self.capacity = copy.capacity
         self._keys = copy._keys
+        self.control = alloc[UInt8](
+            {count = self.capacity + GROUP}
+        ).unsafe_leak()
+        unsafe_memcpy(
+            dest=self.control, src=copy.control, count=self.capacity + GROUP
+        )
 
         comptime if Self.caching_hashes:
             self.key_hashes = alloc[Scalar[Self.KeyCountType]](
@@ -360,15 +419,17 @@ struct StringDict[
         )
 
         comptime if Self.destructive:
+            self.deleted_bytes = copy.deleted_bytes
             self.deleted_mask = alloc[UInt8](
-                {count = self.capacity >> 3}
+                {count = self.deleted_bytes}
             ).unsafe_leak()
             unsafe_memcpy(
                 dest=self.deleted_mask,
                 src=copy.deleted_mask,
-                count=self.capacity >> 3,
+                count=self.deleted_bytes,
             )
         else:
+            self.deleted_bytes = 0
             self.deleted_mask = alloc[UInt8]({count = 0}).unsafe_leak()
 
     def __init__(out self, *, deinit move: Self):
@@ -378,11 +439,14 @@ struct StringDict[
             move: The map to move from.
         """
         self._keys = move._keys^
+        self.control = move.control
         self.key_hashes = move.key_hashes
         self._values = move._values^
         self.slot_to_index = move.slot_to_index
         self.deleted_mask = move.deleted_mask
+        self.deleted_bytes = move.deleted_bytes
         self.count = move.count
+        self.occupied = move.occupied
         self.capacity = move.capacity
 
     def __deinit__(deinit self):
@@ -393,11 +457,17 @@ struct StringDict[
                 layout={count = self.capacity},
             )
         )
+        dealloc(
+            Allocation(
+                unsafe_owned_ptr=self.control,
+                layout={count = self.capacity + GROUP},
+            )
+        )
         comptime if Self.destructive:
             dealloc(
                 Allocation(
                     unsafe_owned_ptr=self.deleted_mask,
-                    layout={count = self.capacity >> 3},
+                    layout={count = self.deleted_bytes},
                 )
             )
         else:
@@ -436,13 +506,7 @@ struct StringDict[
         Returns:
             True if the map holds a live entry for it.
         """
-        var key_index = self._find_key_index(key)
-        if key_index == 0:
-            return False
-        comptime if Self.destructive:
-            if self._is_deleted(key_index - 1):
-                return False
-        return True
+        return self._find_slot(key) != -1
 
     def key_bytes(self) -> Int:
         """Returns how many bytes are allocated for the packed key buffer.
@@ -479,9 +543,6 @@ struct StringDict[
         """
         var key_index = self._find_key_index(key)
         if key_index != 0:
-            comptime if Self.destructive:
-                if self._is_deleted(key_index - 1):
-                    raise Error("KeyError: ", key)
             return self._values[key_index - 1].copy()
         raise Error("KeyError: ", key)
 
@@ -506,11 +567,7 @@ struct StringDict[
         """
         var key_index = self._find_key_index(key)
         if key_index != 0:
-            comptime if Self.destructive:
-                if not self._is_deleted(key_index - 1):
-                    return self._values[key_index - 1].copy()
-            else:
-                return self._values[key_index - 1].copy()
+            return self._values[key_index - 1].copy()
         self.put(key, default)
         return default.copy()
 
@@ -532,12 +589,12 @@ struct StringDict[
                 "pop needs a destructive StringDict; this one cannot delete"
             )
         else:
-            var key_index = self._find_key_index(key)
-            if key_index == 0 or self._is_deleted(key_index - 1):
+            var slot = self._find_slot(key)
+            if slot == -1:
                 raise Error("KeyError: ", key)
+            var key_index = Int(self.slot_to_index.unsafe_load(slot))
             var value = self._values[key_index - 1].copy()
-            self.count -= 1
-            self._deleted(key_index - 1)
+            self._remove_at(slot)
             return value^
 
     def pop(mut self, key: StringSlice, default: Self.V) -> Self.V:
@@ -553,12 +610,12 @@ struct StringDict[
         comptime if not Self.destructive:
             return default.copy()
         else:
-            var key_index = self._find_key_index(key)
-            if key_index == 0 or self._is_deleted(key_index - 1):
+            var slot = self._find_slot(key)
+            if slot == -1:
                 return default.copy()
+            var key_index = Int(self.slot_to_index.unsafe_load(slot))
             var value = self._values[key_index - 1].copy()
-            self.count -= 1
-            self._deleted(key_index - 1)
+            self._remove_at(slot)
             return value^
 
     def update(mut self, other: Self):
@@ -665,52 +722,159 @@ struct StringDict[
             key: The key to insert. Its bytes are copied.
             value: The value to associate with it.
         """
-        if self._keys.count >= self.capacity - (self.capacity >> 3):
+        if self.occupied >= self.capacity - (self.capacity >> 3):
             self._rehash()
 
-        var key_hash = hash(key).cast[Self.KeyCountType]()
-        var modulo_mask = self.capacity - 1
-        var slot = Int(key_hash & Scalar[Self.KeyCountType](modulo_mask))
+        var key_hash = hash(key)
+        var mask = self.capacity - 1
+        var tag = SIMD[DType.uint8, GROUP](Self._tag(key_hash))
+        var slot = Int(key_hash & UInt64(mask))
+        var reusable = -1
+
         while True:
-            var key_index = Int(self.slot_to_index.unsafe_load(slot))
-            if key_index == 0:
-                self._keys.add(key)
+            var group = self.control.unsafe_offset(slot).unsafe_load[
+                width=GROUP
+            ]()
 
-                comptime if Self.caching_hashes:
-                    self.key_hashes.unsafe_store(slot, key_hash)
-                self._values.append(value.copy())
-                self.count += 1
-                self.slot_to_index.unsafe_store(
-                    slot, Scalar[Self.KeyCountType](self._keys.count)
-                )
-                return
-
-            comptime if Self.caching_hashes:
-                var other_key_hash = self.key_hashes[unsafe_offset=slot]
-                if other_key_hash == key_hash:
-                    var other_key = self._keys[key_index - 1]
-                    if other_key == key:
-                        # replace value
+            # Does one of these slots already hold this key? Most groups hold
+            # no candidate at all, and one reduce answers that.
+            var matches = group.eq(tag)
+            if matches.reduce_or():
+                while True:
+                    var lane = Self._first_lane(matches)
+                    if lane == GROUP:
+                        break
+                    var candidate = (slot + lane) & mask
+                    var key_index = Int(
+                        self.slot_to_index.unsafe_load(candidate)
+                    )
+                    if self._matches(candidate, key_index, key, key_hash):
                         self._values[key_index - 1] = value.copy()
-
-                        comptime if Self.destructive:
-                            if self._is_deleted(key_index - 1):
-                                self.count += 1
-                                self._not_deleted(key_index - 1)
                         return
-            else:
-                var other_key = self._keys[key_index - 1]
-                if other_key == key:
-                    # replace value
-                    self._values[key_index - 1] = value.copy()
+                    matches[lane] = False
 
-                    comptime if Self.destructive:
-                        if self._is_deleted(key_index - 1):
-                            self.count += 1
-                            self._not_deleted(key_index - 1)
-                    return
+            # Remember the first slot an insert could take. A free slot carries
+            # the high bit, whether it is empty or deleted.
+            if reusable == -1:
+                var lane = Self._first_lane(
+                    (group & SIMD[DType.uint8, GROUP](0x80)).eq(
+                        SIMD[DType.uint8, GROUP](0x80)
+                    )
+                )
+                if lane != GROUP:
+                    reusable = (slot + lane) & mask
 
-            slot = (slot + 1) & modulo_mask
+            # An empty slot ends the probe: the key is not in the table.
+            if group.eq(SIMD[DType.uint8, GROUP](_EMPTY)).reduce_or():
+                break
+            slot = (slot + GROUP) & mask
+
+        self._keys.add(key)
+        self._values.append(value.copy())
+        self._reserve_deleted_bit(self._keys.count - 1)
+        self.count += 1
+        if self.control[unsafe_offset=reusable] == _EMPTY:
+            self.occupied += 1
+        self._occupy(reusable, key_hash, self._keys.count)
+
+    @always_inline
+    @staticmethod
+    def _tag(key_hash: UInt64) -> UInt8:
+        """The seven hash bits kept in the control byte.
+
+        They come from the opposite end of the hash to the bits that choose
+        the slot, so the two are independent and the tag actually discriminates
+        between the keys that land in one group.
+        """
+        return UInt8((key_hash >> 57) & 0x7F)
+
+    @always_inline
+    @staticmethod
+    def _first_lane(mask: SIMD[DType.bool, GROUP]) -> Int:
+        """Index of the lowest set lane, or `GROUP` when none is set.
+
+        Three SIMD instructions rather than one extract per lane: on a target
+        with no movemask, unrolling the extraction costs more than the group
+        compare it was meant to exploit.
+        """
+        return Int(
+            mask.select(
+                _LANE_INDICES, SIMD[DType.uint8, GROUP](GROUP)
+            ).reduce_min()
+        )
+
+    @always_inline
+    def _matches(
+        self, slot: Int, key_index: Int, key: StringSlice, key_hash: UInt64
+    ) -> Bool:
+        """Whether the entry at `slot` really is `key`, past the tag match."""
+        comptime if Self.caching_hashes:
+            if (
+                self.key_hashes[unsafe_offset=slot]
+                != key_hash.cast[Self.KeyCountType]()
+            ):
+                return False
+        return self._keys[key_index - 1] == key
+
+    @always_inline
+    def _occupy(mut self, slot: Int, key_hash: UInt64, key_index: Int):
+        """Writes an entry into a slot, control byte and mirror included."""
+        self.slot_to_index.unsafe_store(
+            slot, Scalar[Self.KeyCountType](key_index)
+        )
+        comptime if Self.caching_hashes:
+            self.key_hashes.unsafe_store(
+                slot, key_hash.cast[Self.KeyCountType]()
+            )
+        var tag = Self._tag(key_hash)
+        self.control[unsafe_offset=slot] = tag
+        if slot < GROUP:
+            self.control[unsafe_offset=self.capacity + slot] = tag
+
+    @always_inline
+    def _vacate(mut self, slot: Int):
+        """Marks a slot deleted: a probe walks past it, an insert may take it.
+        """
+        self.control[unsafe_offset=slot] = _DELETED
+        if slot < GROUP:
+            self.control[unsafe_offset=self.capacity + slot] = _DELETED
+
+    @always_inline
+    def _remove_at(mut self, slot: Int):
+        """Tombstones the entry in `slot`.
+
+        The control byte stops the slot matching any tag, so the key can no
+        longer be found; the per-entry bit is what iteration consults, since it
+        walks entries rather than slots.
+        """
+        comptime if Self.destructive:
+            var key_index = Int(self.slot_to_index.unsafe_load(slot))
+            self._deleted(key_index - 1)
+            self._vacate(slot)
+            self.count -= 1
+
+    @no_inline
+    def _reserve_deleted_bit(mut self, index: Int):
+        """Makes sure the tombstone mask covers entry `index`."""
+        comptime if Self.destructive:
+            if index >> 3 < self.deleted_bytes:
+                return
+            var bytes = self.deleted_bytes
+            while bytes <= index >> 3:
+                bytes += bytes if bytes > 0 else 1
+            var grown = alloc[UInt8]({count = bytes}).unsafe_leak()
+            unsafe_memset_zero(grown, bytes)
+            unsafe_memcpy(
+                dest=grown, src=self.deleted_mask, count=self.deleted_bytes
+            )
+            dealloc(
+                Allocation(
+                    unsafe_owned_ptr=self.deleted_mask,
+                    layout={count = self.deleted_bytes},
+                )
+            )
+            self.deleted_mask = grown
+            self.deleted_bytes = bytes
 
     @always_inline
     def _is_deleted(self, index: Int) -> Bool:
@@ -738,85 +902,75 @@ struct StringDict[
         var mask = p.unsafe_load()
         p.unsafe_store(mask & UInt8(~(1 << bit_index)))
 
-    @always_inline
+    @no_inline
     def _rehash(mut self):
-        var old_slot_to_index = self.slot_to_index
+        """Doubles the table, dropping deleted slots on the way.
+
+        Tombstones are not carried over, which is what stops a map that churns
+        from growing without bound. Hashes are recomputed rather than reused:
+        the control byte keeps only seven bits and the cached hash is narrowed
+        to `KeyCountType`, so neither can reconstruct the tag for the new table.
+        """
         var old_capacity = self.capacity
+        var old_control = self.control
+        var old_slot_to_index = self.slot_to_index
+        var old_key_hashes = self.key_hashes
+
         self.capacity <<= 1
-        var mask_capacity = self.capacity >> 3
         self.slot_to_index = alloc[Scalar[Self.KeyCountType]](
             {count = self.capacity}
         ).unsafe_leak()
         unsafe_memset_zero(self.slot_to_index, self.capacity)
-
-        var key_hashes = self.key_hashes
+        self.control = alloc[UInt8](
+            {count = self.capacity + GROUP}
+        ).unsafe_leak()
+        unsafe_memset(self.control, _EMPTY, self.capacity + GROUP)
 
         comptime if Self.caching_hashes:
-            key_hashes = alloc[Scalar[Self.KeyCountType]](
+            self.key_hashes = alloc[Scalar[Self.KeyCountType]](
                 {count = self.capacity}
             ).unsafe_leak()
 
-        comptime if Self.destructive:
-            var deleted_mask = alloc[UInt8](
-                {count = mask_capacity}
-            ).unsafe_leak()
-            unsafe_memset_zero(deleted_mask, mask_capacity)
-            unsafe_memcpy(
-                dest=deleted_mask,
-                src=self.deleted_mask,
-                count=old_capacity >> 3,
-            )
-            dealloc(
-                Allocation(
-                    unsafe_owned_ptr=self.deleted_mask,
-                    layout={count = old_capacity >> 3},
-                )
-            )
-            self.deleted_mask = deleted_mask
-
-        var modulo_mask = self.capacity - 1
+        self.occupied = 0
+        var mask = self.capacity - 1
         for i in range(old_capacity):
-            if old_slot_to_index[unsafe_offset=i] == 0:
-                continue
-            var key_hash: Scalar[Self.KeyCountType]
-
-            comptime if Self.caching_hashes:
-                key_hash = self.key_hashes[unsafe_offset=i]
-            else:
-                key_hash = hash(
-                    self._keys[Int(old_slot_to_index[unsafe_offset=i] - 1)]
-                ).cast[Self.KeyCountType]()
-
-            var slot = Int(key_hash & Scalar[Self.KeyCountType](modulo_mask))
-
+            if (old_control[unsafe_offset=i] & 0x80) != 0:
+                continue  # empty or deleted
+            var key_index = Int(old_slot_to_index[unsafe_offset=i])
+            var key_hash = hash(self._keys[key_index - 1])
+            var slot = Int(key_hash & UInt64(mask))
             while True:
-                var key_index = Int(self.slot_to_index.unsafe_load(slot))
-
-                if key_index == 0:
-                    self.slot_to_index.unsafe_store(
-                        slot, old_slot_to_index[unsafe_offset=i]
-                    )
-                    break
-                else:
-                    slot = (slot + 1) & modulo_mask
-
-            comptime if Self.caching_hashes:
-                key_hashes[unsafe_offset=slot] = key_hash
-
-        comptime if Self.caching_hashes:
-            dealloc(
-                Allocation(
-                    unsafe_owned_ptr=self.key_hashes,
-                    layout={count = old_capacity},
+                var group = self.control.unsafe_offset(slot).unsafe_load[
+                    width=GROUP
+                ]()
+                var lane = Self._first_lane(
+                    group.eq(SIMD[DType.uint8, GROUP](_EMPTY))
                 )
+                if lane != GROUP:
+                    self._occupy((slot + lane) & mask, key_hash, key_index)
+                    self.occupied += 1
+                    break
+                slot = (slot + GROUP) & mask
+
+        dealloc(
+            Allocation(
+                unsafe_owned_ptr=old_control,
+                layout={count = old_capacity + GROUP},
             )
-            self.key_hashes = key_hashes
+        )
         dealloc(
             Allocation(
                 unsafe_owned_ptr=old_slot_to_index,
                 layout={count = old_capacity},
             )
         )
+        comptime if Self.caching_hashes:
+            dealloc(
+                Allocation(
+                    unsafe_owned_ptr=old_key_hashes,
+                    layout={count = old_capacity},
+                )
+            )
 
     def get(self, key: StringSlice, default: Self.V) -> Self.V:
         """Returns the value for `key`, or `default` if it is not there.
@@ -831,10 +985,6 @@ struct StringDict[
         var key_index = self._find_key_index(key)
         if key_index == 0:
             return default.copy()
-
-        comptime if Self.destructive:
-            if self._is_deleted(key_index - 1):
-                return default.copy()
         return self._values[key_index - 1].copy()
 
     def delete(mut self, key: StringSlice):
@@ -849,12 +999,10 @@ struct StringDict[
         comptime if not Self.destructive:
             return
 
-        var key_index = self._find_key_index(key)
-        if key_index == 0:
+        var slot = self._find_slot(key)
+        if slot == -1:
             return
-        if not self._is_deleted(key_index - 1):
-            self.count -= 1
-        self._deleted(key_index - 1)
+        self._remove_at(slot)
 
     def upsert(
         mut self,
@@ -875,50 +1023,68 @@ struct StringDict[
             var value = update(None)
             self.put(key, value)
         else:
-            key_index -= 1
-
-            comptime if Self.destructive:
-                if self._is_deleted(key_index):
-                    self.count += 1
-                    self._not_deleted(key_index)
-                    self._values[key_index] = update(None)
-                    return
-
-            self._values[key_index] = update(self._values[key_index].copy())
+            self._values[key_index - 1] = update(
+                self._values[key_index - 1].copy()
+            )
 
     def clear(mut self):
         """Removes every entry, keeping the allocated storage."""
         self._values.clear()
         self._keys.clear()
         unsafe_memset_zero(self.slot_to_index, self.capacity)
+        unsafe_memset(self.control, _EMPTY, self.capacity + GROUP)
+        self.occupied = 0
 
         comptime if Self.destructive:
-            unsafe_memset_zero(self.deleted_mask, self.capacity >> 3)
+            unsafe_memset_zero(self.deleted_mask, self.deleted_bytes)
         self.count = 0
 
     @always_inline
-    def _find_key_index(self, key: StringSlice) -> Int:
-        var key_hash = hash(key).cast[Self.KeyCountType]()
-        var modulo_mask = self.capacity - 1
+    def _find_slot(self, key: StringSlice) -> Int:
+        """Returns the slot holding `key`, or -1.
 
-        var slot = Int(key_hash & Scalar[Self.KeyCountType](modulo_mask))
+        A deleted slot never matches a tag, so a deleted key is simply not
+        found -- the tombstone bit is not consulted here at all.
+        """
+        var key_hash = hash(key)
+        var mask = self.capacity - 1
+        var tag = SIMD[DType.uint8, GROUP](Self._tag(key_hash))
+        var slot = Int(key_hash & UInt64(mask))
         while True:
-            var key_index = Int(self.slot_to_index.unsafe_load(slot))
-            if key_index == 0:
-                return key_index
+            var group = self.control.unsafe_offset(slot).unsafe_load[
+                width=GROUP
+            ]()
+            var matches = group.eq(tag)
+            if matches.reduce_or():
+                while True:
+                    var lane = Self._first_lane(matches)
+                    if lane == GROUP:
+                        break
+                    var candidate = (slot + lane) & mask
+                    var key_index = Int(
+                        self.slot_to_index.unsafe_load(candidate)
+                    )
+                    if self._matches(candidate, key_index, key, key_hash):
+                        return candidate
+                    matches[lane] = False
+            if group.eq(SIMD[DType.uint8, GROUP](_EMPTY)).reduce_or():
+                return -1
+            slot = (slot + GROUP) & mask
 
-            comptime if Self.caching_hashes:
-                var other_key_hash = self.key_hashes[unsafe_offset=slot]
-                if key_hash == other_key_hash:
-                    var other_key = self._keys[key_index - 1]
-                    if other_key == key:
-                        return key_index
-            else:
-                var other_key = self._keys[key_index - 1]
-                if other_key == key:
-                    return key_index
+    @always_inline
+    def _find_key_index(self, key: StringSlice) -> Int:
+        """Returns the one-based index of `key`'s entry, or 0 if absent.
 
-            slot = (slot + 1) & modulo_mask
+        Args:
+            key: The key to look for.
+
+        Returns:
+            The entry's index plus one, or zero.
+        """
+        var slot = self._find_slot(key)
+        if slot == -1:
+            return 0
+        return Int(self.slot_to_index.unsafe_load(slot))
 
 
 # ===-----------------------------------------------------------------------===#

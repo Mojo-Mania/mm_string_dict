@@ -27,9 +27,11 @@ The trigger now counts occupied slots, which is `self.keys.count`:
 if self.keys.count >= self.capacity - (self.capacity >> 3):
 ```
 
-Tombstoned entries are still never reclaimed, so a long churn grows the table
-rather than reusing the space. Compacting during `_rehash` would fix that and is
-listed in [`improvements.md`](improvements.md).
+That was the minimal fix. The Swiss-table rewrite that followed made it moot:
+a deleted slot now carries a `_DELETED` control byte, so an insert can take it
+back, and `_rehash` drops tombstones instead of copying them. What still leaks
+is the deleted entry's key bytes and value, which is item 2 of
+[`improvements.md`](improvements.md).
 
 Covered by `test_delete_heavy_churn_terminates`.
 

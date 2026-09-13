@@ -10,9 +10,12 @@ one byte buffer, with a parallel array of end offsets, so a key costs its bytes
 plus one offset — no per-key header, no per-key allocation. Lookups compare
 against slices of that buffer.
 
-The map itself is open addressing with linear probing over a power-of-two slot
-array. A slot holds a **one-based** index into the key and value arrays, so
-zero means "empty" and no separate occupancy bitmap is needed.
+The map itself is a Swiss table: open addressing over a power-of-two slot
+array, with a **control byte** per slot holding either "empty", "deleted", or
+seven bits of the key's hash. Those seven bits come from the opposite end of
+the hash to the bits that choose the slot, so they are independent of it, and a
+probe compares a whole group of them at once — `simd_width_of[uint8]()` slots
+per instruction, which is 16 with NEON and 32 with AVX2.
 
 ```mojo
 from mm_string_dict import StringDict
@@ -64,7 +67,7 @@ StringDict[Int]                                       # the defaults
 StringDict[Int, DType.uint16]                         # ≤65535 entries, half the slot array
 StringDict[Int, DType.uint32, DType.uint16]           # ≤64KB of keys in total
 StringDict[Int, DType.uint32, DType.uint32, False]    # no delete, no tombstone bitmap
-StringDict[Int, DType.uint32, DType.uint32, True, False]  # don't cache hashes
+StringDict[Int, DType.uint32, DType.uint32, True, True]   # cache full hashes too
 ```
 
 | Parameter | Default | What it costs |
@@ -73,7 +76,7 @@ StringDict[Int, DType.uint32, DType.uint32, True, False]  # don't cache hashes
 | `KeyCountType` | `uint32` | Indexes keys and slots, so it caps the entry count. |
 | `KeyOffsetType` | `uint32` | Holds key end offsets, so it caps the **total** size of all keys. |
 | `destructive` | `True` | One bit per entry for the tombstone mask. Off means `delete` does nothing. |
-| `caching_hashes` | `True` | `KeyCountType` bytes per slot, and worth it — see below. |
+| `caching_hashes` | `False` | `KeyCountType` bytes per slot for a second filter after the control byte. Off by default: the tag already rejects 127 of every 128 non-matching slots, so it buys a few percent on lookups and costs the memory this container exists to save. |
 
 ## API
 
@@ -97,34 +100,37 @@ StringDict[Int, DType.uint32, DType.uint32, True, False]  # don't cache hashes
 
 ## Performance
 
-20000 entries of 12 random characters, Apple M-series, nanoseconds per
-operation, release build (`-D ASSERT=none`, which is what `pixi run bench`
-passes). Reproduce with `pixi run bench`.
+20000 entries of 12 random characters, Apple M-series, release build
+(`-D ASSERT=none`, which is what `pixi run bench` passes). Nanoseconds per
+operation, lower is better.
 
 | Operation | StringDict | stdlib `Dict[String, Int]` |
 | --- | --- | --- |
-| build | 23.1 | **19.2** |
-| lookup, present | 16.8 | **12.8** |
-| membership, absent | 5.6 | **3.7** |
-| build, 64-byte keys | 28.9 | **19.9** |
+| lookup, present | **14.9** | 15.1 |
+| membership, absent | **3.2** | 3.5 |
+| membership, absent, table at 85% load | **3.8** | 3.4 |
+| build | 19.5 | **16.8** |
 
-**The stdlib `Dict` is faster here, and this is not a speed play.** What this
-one buys is key density: 20000 twelve-byte keys occupy 240000 bytes, and the
-container holds them in 283702 bytes of buffer plus 80000 bytes of offsets —
-about 1.5 bytes of overhead per key. A `Dict[String, Int]` stores a `String`
-per entry instead, which is 24 bytes of header each before any of its bytes,
-and a separate allocation each once a key outgrows the inline buffer.
+Lookups are now level with the stdlib `Dict`, and the high-load case — the one
+that used to fall apart — holds up: before the control byte, a miss at 85% load
+walked 24 slots on average and up to 468, because deleting never freed a slot
+and linear probing clustered. Now a probe scans 16 slots per compare and stops
+at the first group containing an empty one.
 
-So: reach for this when you hold a great many string keys and care about
-footprint, or when you want the keys contiguous for other reasons. Reach for
-the stdlib `Dict` when you want the fastest lookups.
+Inserts are still ~16% behind, which is where the remaining work is.
 
-Caching hashes earns its keep:
+**Memory is the reason to reach for this.** 20000 twelve-byte keys are 240000
+bytes; the container holds them in 283702 bytes of buffer plus 80000 bytes of
+offsets — about 1.5 bytes of overhead per key. A `Dict[String, Int]` stores a
+`String` per entry instead: 24 bytes of header each before any of its bytes,
+and a separate allocation once a key outgrows the inline buffer. The slot table
+costs 5 bytes per slot (1 control byte + 4 index), down from 8 before the
+control byte replaced the cached hash.
 
-| build, per insert | |
-| --- | --- |
-| `caching_hashes=True` (default) | **24.9** |
-| `caching_hashes=False` | 30.7 |
+A note on the benchmark suite: it runs everything in one process, and a
+benchmark's allocator state carries into the next, which moves the build
+figures by a few nanoseconds either way. The build numbers above were taken one
+variant per process.
 
 ## Development
 

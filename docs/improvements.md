@@ -3,37 +3,34 @@
 Open items, most worthwhile first. Numbers are release builds
 (`-D ASSERT=none`).
 
-## 1. Tombstones are never reclaimed
+## 1. Inserts are ~16% behind the stdlib `Dict`
 
-`delete` marks an entry dead in a bitmask; its slot, its key bytes and its
-value all stay. Nothing ever reclaims them, so a map that churns grows without
-bound — the table doubles because occupied slots keep rising, even though the
-live count does not.
+19.5 ns against 16.8 for 20000 twelve-byte keys, measured one variant per
+process. Lookups are level now; inserts are not. Worth profiling before
+guessing: candidates are the two group scans `put` does (one for an existing
+key, one for a free slot), appending into three growable regions, and the
+tombstone-mask growth check on every insert.
 
-`_rehash` is the natural place to fix it: it already walks every slot and
-rebuilds the table, so it could skip deleted entries and compact the key buffer
-and value list at the same time. The catch is that compacting renumbers key
-indices, so every slot that survives has to be renumbered with them, and any
-`StringSlice` a caller is holding into the key buffer is invalidated.
+## 2. Deleted entries still hold their key bytes and value
 
-## 2. Lookups are slower than the stdlib `Dict`
+A deleted entry's slot is reclaimed -- `_rehash` drops tombstones and an insert
+can take a deleted slot -- but its key bytes stay in the packed buffer and its
+value stays in the list, because entries are addressed by a dense index that
+nothing renumbers. A map that churns therefore grows in key storage even though
+the table does not.
 
-16.8 ns against 12.8 for a present key, 5.6 against 3.7 for an absent one.
-Probing is a plain scalar loop over `slot_to_index`, one slot at a time, with a
-dependent load per step. The stdlib set and dict use SIMD probing over a group
-of slots at once, which is where most of that gap probably lives.
-
-Worth measuring before building: the cached hash already rejects most
-mismatches without touching the key bytes, so the win may be smaller than it
-looks.
+`_rehash` is the place to fix it: it already visits every live entry, so it
+could compact the key buffer and the value list at the same time and renumber
+the slots it is rebuilding anyway. The cost is that any `StringSlice` a caller
+is holding into the key buffer would be invalidated.
 
 ## 3. Values sit in a `List`, keys do not
 
-The keys avoid a per-entry allocation; the values do not avoid a `List`, which
-is fine, but it does mean `StringDict` owns three growable regions that grow
-independently. Holding them in one allocation, the way `mm_fiby_tree` and
-`mm_lcrs_tree` do, would cut the allocation count per map and shrink the
-handle.
+The keys avoid a per-entry allocation; the values do not avoid a `List`. That
+is fine in itself, but it means a map owns four growable regions that grow
+independently -- keys, key offsets, values, and the slot table. Holding them in
+one allocation, the way `mm_fiby_tree` and `mm_lcrs_tree` do, would cut the
+allocation count per map and shrink the handle.
 
 ## 4. Smaller items
 

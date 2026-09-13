@@ -7,6 +7,10 @@ should show up on build time and on memory, and cost nothing on lookup.
 
 Every number is nanoseconds per operation. Lower is better. The keys come from
 a fixed seed, so runs are comparable.
+
+One caveat: these all run in one process, and a benchmark's allocator state
+carries into the next, which moves the build figures by a few nanoseconds. The
+build numbers quoted in the README were taken one variant per process.
 """
 
 from mm_string_dict import StringDict
@@ -154,26 +158,6 @@ def bench_contains(keys: List[String], probes: List[String]) raises:
     report("stdlib Dict", per_op(measure(probe_stdlib), count))
 
 
-def bench_without_cached_hashes(keys: List[String]) raises:
-    header("build, with and without cached hashes (per insert)")
-    var count = len(keys)
-
-    def cached() raises {imm keys}:
-        var map = StringDict[Int]()
-        for i in range(len(keys)):
-            map.put(keys[i], i)
-        keep(len(map))
-
-    def uncached() raises {imm keys}:
-        var map = StringDict[Int, DType.uint32, DType.uint32, True, False]()
-        for i in range(len(keys)):
-            map.put(keys[i], i)
-        keep(len(map))
-
-    report("caching_hashes", per_op(measure(cached), count))
-    report("no caching", per_op(measure(uncached), count))
-
-
 def report_memory(keys: List[String]) raises:
     var map = StringDict[Int]()
     for i in range(len(keys)):
@@ -197,6 +181,52 @@ def report_memory(keys: List[String]) raises:
     )
 
 
+def bench_at_high_load(keys: List[String], misses: List[String]) raises:
+    """The same lookups with the table nearly full.
+
+    The default benchmark sits at 61% load, because the table doubles at 87.5%
+    and had just done so. Probe chains are short there. This fills a table to
+    just under the threshold, which is where probing actually costs something.
+    """
+    comptime FILL = 28_000  # 85% of 32768
+    header("lookup at 85% load (per lookup)")
+
+    var map = StringDict[Int]()
+    var stdlib = Dict[String, Int]()
+    for i in range(FILL):
+        map.put(keys[i], i)
+        stdlib[keys[i]] = i
+
+    var probes = List[String](capacity=4000)
+    for i in range(4000):
+        probes.append(misses[i])
+    var count = len(probes)
+
+    def miss_dict() raises {imm map, imm probes}:
+        var hits = 0
+        for i in range(len(probes)):
+            if probes[i] in map:
+                hits += 1
+        keep(hits)
+
+    def miss_stdlib() raises {imm stdlib, imm probes}:
+        var hits = 0
+        for i in range(len(probes)):
+            if probes[i] in stdlib:
+                hits += 1
+        keep(hits)
+
+    def hit_dict() raises {imm map, imm keys}:
+        var total = 0
+        for i in range(4000):
+            total += map.get(keys[i], 0)
+        keep(total)
+
+    report("StringDict, miss", per_op(measure(miss_dict), count))
+    report("stdlib Dict, miss", per_op(measure(miss_stdlib), count))
+    report("StringDict, hit", per_op(measure(hit_dict), 4000))
+
+
 def main() raises:
     print("StringDict benchmarks --", SIZE, "entries, ns per operation")
     var keys = random_keys(SIZE)
@@ -205,7 +235,9 @@ def main() raises:
     bench_build("build from random keys (per insert)", keys)
     bench_lookup("lookup, every probe present (per lookup)", keys, keys)
     bench_contains(keys, misses)
-    bench_without_cached_hashes(keys)
+    bench_at_high_load(
+        random_keys(30_000), random_keys(30_000, seed=0x1234_5678)
+    )
 
     var long_keys = random_keys(SIZE, length=64)
     bench_build("build from 64-byte keys (per insert)", long_keys)

@@ -1,4 +1,4 @@
-from mm_string_dict import KeysContainer, StringDict
+from mm_string_dict import GROUP, KeysContainer, StringDict
 from std.testing import (
     TestSuite,
     assert_equal,
@@ -179,9 +179,11 @@ def test_small_initial_capacity() raises:
 
 
 def test_capacity_is_rounded_to_a_power_of_two() raises:
-    assert_equal(StringDict[Int](capacity=1).capacity, 8)
-    assert_equal(StringDict[Int](capacity=16).capacity, 16)
-    assert_equal(StringDict[Int](capacity=17).capacity, 32)
+    """The floor is one SIMD group, since a probe scans a whole group."""
+    assert_equal(StringDict[Int](capacity=1).capacity, GROUP)
+    assert_equal(StringDict[Int](capacity=GROUP).capacity, GROUP)
+    assert_equal(StringDict[Int](capacity=GROUP * 2).capacity, GROUP * 2)
+    assert_equal(StringDict[Int](capacity=GROUP * 2 + 1).capacity, GROUP * 4)
 
 
 # ===-----------------------------------------------------------------------===#
