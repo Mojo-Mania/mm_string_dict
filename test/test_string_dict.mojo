@@ -679,5 +679,108 @@ def test_tombstones_survive_mask_growth() raises:
     assert_equal(seen, len(live))
 
 
+# ===-----------------------------------------------------------------------===#
+# Cached hashes
+#
+# With `caching_hashes` on, a rehash reuses each entry's stored hash instead of
+# hashing the key again. That makes the stored hash load-bearing for placement,
+# not just a lookup filter: a hash written to the wrong entry, or lost when the
+# array grows, puts a key in a slot no probe will reach. These tests grow the
+# table repeatedly, which is the only way to exercise that.
+# ===-----------------------------------------------------------------------===#
+
+comptime CachingDict = StringDict[Int, DType.uint32, DType.uint32, True, True]
+
+
+def test_with_cached_hashes() raises:
+    var dict = CachingDict()
+    for i in range(500):
+        dict.put(String("key-", i), i)
+    for i in range(500):
+        assert_equal(dict.get(String("key-", i), -1), i)
+    dict.delete("key-3")
+    assert_false("key-3" in dict)
+    assert_equal(len(dict), 499)
+
+
+def test_cached_hashes_survive_many_rehashes() raises:
+    """Grows the table about twelve times and checks every key after each one.
+
+    A stored hash that did not survive a rehash leaves its key reachable only
+    by luck, so the check has to run after the growth, not just at the end.
+    """
+    var dict = CachingDict()
+    var inserted = 0
+    for i in range(20_000):
+        dict.put(String("k", i), i)
+        inserted += 1
+        if inserted & (inserted - 1) == 0:  # at every power of two
+            for j in range(0, inserted, max(1, inserted // 64)):
+                assert_equal(dict.get(String("k", j), -1), j, String("at ", i))
+
+    assert_equal(len(dict), 20_000)
+    for i in range(20_000):
+        assert_equal(dict.get(String("k", i), -1), i)
+    assert_false("k20000" in dict)
+
+
+def test_cached_hashes_match_uncached_behaviour() raises:
+    """The two variants must agree on every corpus, key for key."""
+    for name in names():
+        var words = load(name)
+        var cached = CachingDict()
+        var plain = StringDict[Int, DType.uint32, DType.uint32, True, False]()
+        for i in range(len(words)):
+            cached.put(words[i], i)
+            plain.put(words[i], i)
+
+        assert_equal(len(cached), len(plain), name)
+        for i in range(len(words)):
+            assert_equal(
+                cached.get(words[i], -1), plain.get(words[i], -2), name
+            )
+
+
+def test_cached_hashes_after_delete_and_reinsert() raises:
+    """A revived key gets a fresh entry, and so needs a fresh stored hash."""
+    var dict = CachingDict()
+    for i in range(2000):
+        dict.put(String("key-", i), i)
+    for i in range(0, 2000, 3):
+        dict.delete(String("key-", i))
+    # Reinserting past the growth threshold forces a rehash over a table that
+    # holds both tombstones and revived entries.
+    for i in range(0, 2000, 3):
+        dict.put(String("key-", i), -i)
+    for i in range(2000, 6000):
+        dict.put(String("key-", i), i)
+
+    assert_equal(len(dict), 6000)
+    for i in range(2000):
+        assert_equal(dict.get(String("key-", i), 1), -i if i % 3 == 0 else i)
+    for i in range(2000, 6000):
+        assert_equal(dict.get(String("key-", i), -1), i)
+
+
+def test_cached_hashes_copy_and_move() raises:
+    """The hash array is owned, so it has to be duplicated, not aliased."""
+    var dict = CachingDict()
+    for i in range(1000):
+        dict.put(String("key-", i), i)
+
+    var duplicate = dict.copy()
+    for i in range(1000, 3000):  # grows the original past the copy
+        dict.put(String("key-", i), i)
+
+    assert_equal(len(duplicate), 1000)
+    for i in range(1000):
+        assert_equal(duplicate.get(String("key-", i), -1), i)
+    assert_false("key-1500" in duplicate)
+
+    var moved = duplicate^
+    for i in range(1000):
+        assert_equal(moved.get(String("key-", i), -1), i)
+
+
 def main() raises:
     TestSuite.discover_tests[__functions_in_module()]().run()

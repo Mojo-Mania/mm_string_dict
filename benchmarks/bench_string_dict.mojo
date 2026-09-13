@@ -19,6 +19,10 @@ near the growth threshold.
 from corpora import describe, load, names
 from mm_string_dict import StringDict
 from std.benchmark import Unit, keep, run
+from std.sys import get_defined_bool
+
+comptime CACHING = get_defined_bool["CACHING", False]()
+comptime Map = StringDict[Int, .uint32, .uint32, True, CACHING]
 
 
 def measure(f: Some[ImplicitlyCopyable & (def() raises)]) raises -> Float64:
@@ -61,7 +65,7 @@ def bench_build(corpora: List[String]) raises:
         var words = load(name)
 
         def ours() raises {imm words}:
-            var map = StringDict[Int]()
+            var map = Map()
             for i in range(len(words)):
                 map.put(words[i], i)
             keep(len(map))
@@ -84,7 +88,7 @@ def bench_word_count(corpora: List[String]) raises:
             return value.value() + 1 if value else 1
 
         def ours() raises {imm words}:
-            var map = StringDict[Int]()
+            var map = Map()
             for i in range(len(words)):
                 map.upsert(words[i], bump)
             keep(len(map))
@@ -106,7 +110,7 @@ def bench_lookup(corpora: List[String]) raises:
     for name in corpora:
         var words = load(name)
         var count = Float64(len(words))
-        var map = StringDict[Int]()
+        var map = Map()
         var theirs_map = Dict[String, Int]()
         for i in range(len(words)):
             map.put(words[i], i)
@@ -138,7 +142,7 @@ def bench_absent(corpora: List[String]) raises:
         # uncorrelated with the stored ones.
         var probes = load("georgian" if name != "georgian" else "hindi")
         var count = Float64(len(probes))
-        var map = StringDict[Int]()
+        var map = Map()
         var theirs_map = Dict[String, Int]()
         for i in range(len(words)):
             map.put(words[i], i)
@@ -168,7 +172,7 @@ def report_density(corpora: List[String]) raises:
     print("   --------------------------------------------")
     for name in corpora:
         var words = load(name)
-        var map = StringDict[Int]()
+        var map = Map()
         for i in range(len(words)):
             map.put(words[i], i)
         var needed = 0
@@ -209,7 +213,7 @@ def bench_at_high_load() raises:
             word += ALPHABET[byte=Int(state & 0x7FFF_FFFF) % 36]
         keys.append(word^)
 
-    var map = StringDict[Int]()
+    var map = Map()
     var theirs_map = Dict[String, Int]()
     for i in range(FILL):
         map.put(keys[i], i)
@@ -235,6 +239,7 @@ def bench_at_high_load() raises:
 
 def main() raises:
     var corpora = names()
+    print("caching_hashes =", CACHING)
 
     print("corpora")
     for name in corpora:

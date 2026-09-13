@@ -27,21 +27,47 @@ Three separate findings:
    ours costs 3.3 ns more per insert than theirs. That is the whole gap.
 
 Inside growth, `_rehash` recomputes `hash()` for every entry it moves, because
-neither the 7-bit control byte nor the narrowed cached hash can rebuild a tag
-for the new table. Doubling moves about two entries per insert amortized, and
-one hash of a 10-byte key is 1.2 ns, so re-hashing accounts for roughly 2.4 of
-the 3.3 ns.
+neither the 7-bit control byte nor the slot a key sat in can rebuild a tag for
+the doubled table. Doubling moves about two entries per insert amortized, and
+one hash of a 10-byte key is 1.2 ns. Turning on `caching_hashes` removes that
+work and recovers 1.4 of the 3.3 ns -- see below; the rest of the gap is still
+open.
 
-### The fix that follows: let `_rehash` reuse hashes
+### Done: `_rehash` reuses hashes, behind `caching_hashes`
 
-It needs a full 64-bit hash per *entry* -- not the current `caching_hashes`,
-which stores a hash narrowed to `KeyCountType` per *slot*, and is therefore
-useless to a rehash on both counts. Keyed by entry it also survives the rehash
-that invalidates every slot.
+`caching_hashes` used to store a hash narrowed to `KeyCountType`, per *slot*,
+which was useless to a rehash on both counts -- narrowed it cannot rebuild a
+tag, and keyed by slot it does not survive the rehash that invalidates every
+slot. It now stores the full 64-bit hash per *entry*, and `_rehash` reuses it:
 
-The price is 8 bytes per entry, against a map that costs roughly 35, so it is a
-real trade against the density this library exists for. It belongs behind the
-`caching_hashes` parameter, redesigned, rather than as an unconditional cost.
+| | caching off | caching on | stdlib |
+| --- | --- | --- | --- |
+| insert, growing from empty | 23.2 ns | 21.9 ns | 19.3 ns |
+| of which growth | 12.3 ns | 10.9 ns | 9.1 ns |
+| corpus build (english) | 15.3 us | 14.9 us | 10.2 us |
+| corpus build (l33t) | 10.7 us | 9.9 us | 7.3 us |
+
+Growth is 11% cheaper and the gap to the stdlib on growth halves, 3.1 ns to
+1.5. Corpus builds gain 4-7%.
+
+Two things it did **not** do, both worth recording because the first was
+predicted and wrong:
+
+- **The saving is 1.4 ns per insert, not the 2.4 predicted** from two hashes at
+  1.2 ns each. Doubling moves about two entries per insert amortized, so the
+  arithmetic was right about how many hashes are skipped; skipping them just
+  frees less than their standalone cost, the loop around them having plenty
+  else to wait on.
+- **Lookups are unchanged, long keys included.** The stored hash also acts as a
+  filter in `_matches` before the key comparison, and that was expected to pay
+  on the CJK corpora, where a comparison runs to 500 bytes. It does not: a
+  lookup that finds its key compares the bytes regardless, and the control
+  byte already rejects 127 of every 128 wrong slots, so the filter almost never
+  fires.
+
+It stays off by default. 8 bytes per entry measured 19-34% of a whole map on
+the corpora, and a 4-7% build gain does not buy that in a container chosen for
+footprint. It is the right switch for an insert-heavy map that grows.
 
 ### Fewer allocations, the way the trees do it
 

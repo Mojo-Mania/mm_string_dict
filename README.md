@@ -189,9 +189,15 @@ weakness — but not where it looks. Taking an insert apart
 (`pixi run bench-anatomy`), a steady-state `put` is already even at 10.8 ns
 against 11.8, and inserting into a pre-sized map is within 4%. The whole gap is
 table growth, which costs 12.3 ns per insert here against the stdlib's 9.0, and
-most of that difference is `_rehash` recomputing a hash for every entry it moves
-where the stdlib reuses a stored one. If you know the size up front, passing
-`StringDict[Int](capacity=n)` removes it.
+much of that difference is `_rehash` recomputing a hash for every entry it moves
+where the stdlib reuses a stored one.
+
+Two switches address it. If you know the size up front,
+`StringDict[Int](capacity=n)` removes the growth entirely. Otherwise
+`caching_hashes` stores each key's full hash by entry so a rehash reuses it,
+taking growth to 10.9 ns and halving the gap — at 8 bytes per entry, which is
+19–34% of a whole map on these corpora. It is off by default for that reason,
+and it does not change lookups.
 
 Word counting is where that reverses, and it now does so on ten of the twelve
 corpora. `upsert` settles a word in one probe against a `Dict`'s read-then-write
@@ -249,11 +255,13 @@ control byte replaced the cached hash.
 ## Development
 
 ```bash
-pixi run test     # the test suite (48 tests)
+pixi run test     # the test suite (53 tests)
 pixi run bench    # the benchmarks above
 pixi run bench-destructive      # the destructive=True variant, alone
 pixi run bench-non-destructive  # the destructive=False variant, alone
 pixi run bench-anatomy          # where an insert's time actually goes
+pixi run bench-cached           # the corpus tables with caching_hashes on
+pixi run bench-anatomy-cached   # the anatomy with caching_hashes on
 pixi run main     # the example
 pixi run format   # mojo format
 pixi run docs     # docstring check

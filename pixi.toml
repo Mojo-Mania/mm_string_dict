@@ -13,6 +13,8 @@ bench = "mojo -D ASSERT=none -I . benchmarks/bench_string_dict.mojo"
 bench-destructive = "mojo -D ASSERT=none -D DESTRUCTIVE=true -I . benchmarks/bench_destructive.mojo"
 bench-non-destructive = "mojo -D ASSERT=none -D DESTRUCTIVE=false -I . benchmarks/bench_destructive.mojo"
 bench-anatomy = "mojo -D ASSERT=none -I . benchmarks/bench_insert_anatomy.mojo"
+bench-cached = "mojo -D ASSERT=none -D CACHING=true -I . benchmarks/bench_string_dict.mojo"
+bench-anatomy-cached = "mojo -D ASSERT=none -D CACHING=true -I . benchmarks/bench_insert_anatomy.mojo"
 format = "mojo format ./"
 docs = "mojo doc --diagnose-missing-doc-strings -o /dev/null mm_string_dict/"
 

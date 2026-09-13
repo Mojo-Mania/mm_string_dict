@@ -15,8 +15,11 @@ Run with `pixi run bench-anatomy`.
 
 from mm_string_dict import StringDict
 from std.benchmark import Unit, keep, run
+from std.sys import get_defined_bool
 
 comptime ALPHABET: StaticString = "abcdefghijklmnopqrstuvwxyz0123456789"
+comptime CACHING = get_defined_bool["CACHING", False]()
+comptime Map = StringDict[Int, .uint32, .uint32, True, CACHING]
 
 
 def measure(f: Some[ImplicitlyCopyable & (def() raises)]) raises -> Float64:
@@ -59,7 +62,7 @@ def bench_fixed_cost() raises:
     """What a map costs before a single key goes into it."""
 
     def ours() raises:
-        var map = StringDict[Int]()
+        var map = Map()
         keep(len(map))
 
     def theirs() raises:
@@ -86,7 +89,7 @@ def bench_steady_state() raises:
     var keys = random_keys(16, 10)
 
     def ours() raises {imm keys}:
-        var map = StringDict[Int]()
+        var map = Map()
         for round in range(1000):
             for i in range(16):
                 map.put(keys[i], round)
@@ -120,13 +123,13 @@ def bench_growth() raises:
     var keys = random_keys(N, 10)
 
     def ours_growing() raises {imm keys}:
-        var map = StringDict[Int]()  # 16 slots, rehashes about nine times
+        var map = Map()  # 16 slots, rehashes about nine times
         for i in range(N):
             map.put(keys[i], i)
         keep(len(map))
 
     def ours_presized() raises {imm keys}:
-        var map = StringDict[Int](capacity=8192)  # never rehashes
+        var map = Map(capacity=8192)  # never rehashes
         for i in range(N):
             map.put(keys[i], i)
         keep(len(map))
@@ -191,6 +194,7 @@ def bench_growth() raises:
 
 
 def main() raises:
+    print("caching_hashes =", CACHING)
     bench_fixed_cost()
     bench_steady_state()
     bench_growth()
