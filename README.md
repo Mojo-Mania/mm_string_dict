@@ -255,7 +255,7 @@ control byte replaced the cached hash.
 ## Development
 
 ```bash
-pixi run test     # the test suite (53 tests)
+pixi run test     # the test suite (54 tests)
 pixi run bench    # the benchmarks above
 pixi run bench-destructive      # the destructive=True variant, alone
 pixi run bench-non-destructive  # the destructive=False variant, alone

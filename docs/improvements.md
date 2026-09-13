@@ -72,54 +72,58 @@ footprint. It is the right switch for an insert-heavy map that grows.
 ### Fewer allocations, the way the trees do it
 
 `mm_fiby_tree` and `mm_lcrs_tree` hold all their index regions in one
-allocation. The same treatment here would merge the three capacity-sized arrays
--- control bytes, slot indices and cached hashes, which are already reallocated
-together in `_rehash` -- into one region, and take a constructor from six
-allocations to four.
+allocation. The obvious question is whether the six here can be one region,
+since they all grow. They cannot, because they are two families on different
+schedules:
 
-Measured against the numbers above, this is worth doing for the **fixed cost**,
-not for the insert gap: growth allocates O(log n) times over a build, which is
-nothing per insert, so merging cannot touch the 3.3 ns. What it touches is the
-269.6 ns to construct a map, which matters when a program holds many small maps
-rather than one big one -- and for the ten-key CJK corpora, where construction
-is about a quarter of the measured build.
+| | sized by | grows | factor |
+| --- | --- | --- | --- |
+| `control`, `slot_to_index` | slot capacity | in `_rehash`, at 7/8 load | 2x |
+| `keys`, `keys_end` | key bytes, entry count | in `KeysContainer.add` | 1.5x |
+| `entry_hashes`, `deleted_mask` | entry count | on insert, paired to `_keys.capacity` | 2x |
 
-For that fixed cost, though, the bigger lever is **allocating nothing until the
-first insert**, which is what the stdlib `Dict` does to reach 0.2 ns. Merging
-six allocations into four removes perhaps a third of the constructor; deferring
-them removes all of it. Worth doing in that order.
+Measured on a build of 5000 keys, the two families track each other loosely
+but never coincide -- 8192 slots against an entry capacity of 4618, 2048
+against 913. Under churn they diverge outright, since entries are never
+renumbered and a rehash drops tombstones: inserting 20000 keys and deleting
+every other one ends with 16384 slots and an entry capacity of 23377, the
+entry side larger than the slot side.
 
-### Fixed: the tombstone mask check cost 19% of an insert
+So a merge is two regions, not one:
 
-`destructive=True` is the default, and it used to make inserts 19% slower than
-`destructive=False` (25.2 ns against 20.3 at 28000 keys). The bit itself was
-never the problem. `_reserve_deleted_bit` was `@no_inline` and did its bounds
-check *inside* the function, so every insert paid for a call to learn that the
-mask was already big enough.
+- **The slot family is a true merge.** `control` and `slot_to_index` are both
+  exactly `capacity` long and are always reallocated together in `_rehash`.
+- **The entry family could be merged**, but only by first putting its members
+  on one shared growth schedule, which today they do not share.
 
-Hoisting the check into the caller and leaving only the reallocation behind
-`@no_inline` -- the `_reserve`/`_grow` split from `mm_lcrs_tree` -- took the
-insert to 19.7 ns, level with the non-destructive variant, and pulled 8-16% off
-the corpus builds. Deletion support now costs 1 bit per entry and no measurable
-time. See the table in the README.
+What it is worth is the harder question, and the honest answer is: not much for
+speed. Every allocation-count change measured in this library so far has come
+out inside the noise, because growth allocates O(log n) times over a build.
+The measured prize is the **269.6 ns constructor** (six allocations against the
+stdlib `Dict`'s zero), which matters for programs holding many small maps. And
+even there, deferring allocation until the first insert removes more of it than
+merging six into three would.
 
-The mask is also sized to the keys container's entry capacity when it grows,
-rather than doubling on its own from one byte, which drops it from four
-reallocations to two while building a 200-key map. That change is **below
-measurement noise** on its own -- same-code runs vary by 3-5% -- and is kept for
-the reduced allocator traffic, not for a speedup.
+There is one part of the entry family that is not about allocation count at
+all, and is the most promising piece: `keys_end[i]` and `values[i]` are written
+on the same insert and read together on any lookup that returns a value, from
+two separate arrays. Interleaving *those two* puts both on one cache line. That
+is a locality change, and unlike the rest it could move the steady-state
+number -- though note the steady-state number is already ahead of the stdlib
+(11.4 ns against 12.0), so the headroom is small.
 
-### Killed by measurement: splitting the growth path out of `KeysContainer.add`
+### Killed by measurement: dropping a redundant zero-fill
 
-`add` is `@always_inline` and carries two full realloc paths in its body, the
-same shape that the fix above exploited. Splitting it the same way is
-consistently **2-3% slower**, in the same direction on all ten sizeable corpora
-(english 14.5 -> 15.1 us, german 14.7 -> 15.2).
+`slot_to_index` is zeroed on construction and on every rehash, and the zero is
+never read: every access to it is already guarded by the control byte, which
+says whether a slot is occupied before its index is touched. Removing both
+fills is provably dead work -- `capacity * 4` bytes of `memset` per rehash, 32KB
+at 8192 slots.
 
-The difference between the two cases is where the cheap check already sat. In
-`_reserve_deleted_bit` the hot path was a function call; in `add` it is a few
-instructions around a `memcpy` that were already inline, so the split only
-added a call and register spills at the growth site. Reverted.
+It measures as nothing. Four runs, two each way, overlap completely (22.8/24.0
+against 23.4/24.0 ns per insert). Restored, because "an empty slot's index is
+zero" is a real invariant that a future reader could reasonably lean on, and
+giving it up bought nothing.
 
 ## 2. Long keys: a lookup gap that grows with key length
 
@@ -189,5 +193,13 @@ number.
   the entry had before it was deleted. That is defensible, but it is a
   behaviour worth stating in the docstring rather than leaving to be
   discovered.
-- **No `KeyCountType` overflow check.** Exceeding 65535 entries with
-  `uint16` silently wraps the one-based slot index.
+- ~~**No `KeyCountType` overflow check.**~~ Fixed. Exceeding the cap wrapped
+  the one-based entry index and the map returned other keys' values with no
+  error at all: 300 keys into a `uint8` map gave 45 wrong reads out of 300,
+  with `len()` reporting 300. `put` now checks, and aborts with the cap, the
+  offending entry number, and the fact that deleted entries count toward it.
+  The check is emitted only for index types narrower than 32 bits, where the
+  cap is reachable; `uint32` and wider pay nothing. It is a plain check rather
+  than a `debug_assert`, because the failure is a wrong answer rather than a
+  crash and `debug_assert` compiles out at the assertion levels a release build
+  uses -- it did not fire on the reproduction until `-D ASSERT=all`.

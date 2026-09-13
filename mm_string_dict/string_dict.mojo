@@ -24,8 +24,9 @@ Four compile-time parameters trade memory for capability; see `StringDict`.
 
 from std.bit import bit_width, pop_count
 from std.memory import unsafe_memcpy, unsafe_memset, unsafe_memset_zero
+from std.os import abort
 from std.memory.alloc import Allocation, alloc, dealloc
-from std.sys.info import simd_width_of
+from std.sys.info import simd_width_of, size_of
 
 
 comptime GROUP = simd_width_of[DType.uint8]()
@@ -56,6 +57,11 @@ an insert may reuse it."""
 
 
 comptime _MIN_KEYS = 8
+# `put` checks the entry cap only for index types narrower than this. At 32
+# bits the cap is four billion entries, which no map that fits in memory can
+# reach, so wider types pay nothing for the check. Narrower ones are opt-in and
+# genuinely reachable.
+comptime _CHECKED_INDEX_BITS = 32
 """The smallest key capacity a `KeysContainer` will allocate."""
 
 
@@ -283,8 +289,13 @@ struct StringDict[
     Parameters:
         V: The value type.
         KeyCountType: The unsigned integer type indexing keys and slots. It
-            caps the number of entries: `uint16` allows 65535 and halves the
-            slot array, `uint32` allows four billion.
+            caps the number of entries at its maximum value -- `uint8` 255,
+            `uint16` 65535, the default `uint32` four billion -- and a narrower
+            one shrinks the slot array to match. The cap counts every entry
+            ever inserted, including deleted ones, which are never renumbered;
+            a map that churns reaches it sooner than its live count suggests.
+            Exceeding it is a programming error, and `put` asserts on it in
+            builds with assertions enabled.
         KeyOffsetType: The unsigned integer type holding key end offsets, which
             caps the total size of all keys together.
         destructive: Whether `delete` is supported. It costs one bit per entry
@@ -772,6 +783,36 @@ struct StringDict[
                 break
             slot = (slot + GROUP) & mask
 
+        # `slot_to_index` holds a one-based entry index in a
+        # `Scalar[KeyCountType]`, so entry number `MAX` is the last one that
+        # can be addressed. Past it the index wraps and the map silently hands
+        # back other keys' values. Entries include deleted ones, which are
+        # never renumbered, so a churning map reaches this sooner than its live
+        # count suggests.
+        comptime INDEX_BITS = size_of[Scalar[Self.KeyCountType]]() * 8
+        comptime if INDEX_BITS < _CHECKED_INDEX_BITS:
+            # Computed from the width rather than from `Scalar.MAX`, which
+            # wraps to -1 for `uint64` once it is cast to a signed `Int`.
+            comptime MAX_ENTRIES = (1 << INDEX_BITS) - 1
+            # Always checked, not `debug_assert`: the failure is a wrong answer
+            # rather than a crash, and it is silent at the assertion levels a
+            # release build uses.
+            if self._keys.count >= MAX_ENTRIES:
+                abort(
+                    String(
+                        "StringDict: ",
+                        MAX_ENTRIES,
+                        (
+                            " entries is all this KeyCountType can index, and"
+                            " this is entry "
+                        ),
+                        self._keys.count + 1,
+                        (
+                            ". Widen KeyCountType. Deleted entries count, since"
+                            " they are never renumbered."
+                        ),
+                    )
+                )
         self._keys.add(key)
         self._values.append(value.copy())
         self._reserve_deleted_bit(self._keys.count - 1)

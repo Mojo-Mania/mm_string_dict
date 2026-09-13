@@ -782,5 +782,26 @@ def test_cached_hashes_copy_and_move() raises:
         assert_equal(moved.get(String("key-", i), -1), i)
 
 
+def test_narrow_key_count_type_is_correct_up_to_its_cap() raises:
+    """A `uint8` map must be exact at 255 entries, the last it can index.
+
+    Past that the one-based entry index wraps and the map returns other keys'
+    values with no error -- `put` asserts on it. This pins the boundary that
+    the assert is placed at.
+    """
+    var dict = StringDict[Int, DType.uint8]()
+    for i in range(255):
+        dict.put(String("k", i), i)
+
+    assert_equal(len(dict), 255)
+    for i in range(255):
+        assert_equal(dict.get(String("k", i), -1), i)
+
+    # Replacing a value adds no entry, so this stays inside the cap.
+    dict.put("k7", 7000)
+    assert_equal(len(dict), 255)
+    assert_equal(dict.get("k7", -1), 7000)
+
+
 def main() raises:
     TestSuite.discover_tests[__functions_in_module()]().run()
