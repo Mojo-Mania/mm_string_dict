@@ -132,18 +132,18 @@ Nanoseconds per lookup, lower is better.
 | corpus | look up every word | | membership, probe from another script | |
 | --- | --- | --- | --- | --- |
 | | StringDict | stdlib | StringDict | stdlib |
-| english | 7.0 | **6.5** | **2.5** | 2.8 |
-| german | 7.6 | **7.4** | **2.9** | 3.1 |
-| l33t | **7.1** | 7.2 | **2.2** | 2.5 |
-| french | 8.3 | **8.2** | **2.6** | 2.9 |
-| greek | **8.2** | 8.7 | **2.3** | 2.6 |
-| arabic | **9.2** | 9.4 | **2.3** | 2.6 |
-| hebrew | 9.1 | **9.0** | **2.2** | 2.5 |
-| hindi | **8.7** | 9.0 | **2.2** | 2.5 |
-| georgian | 8.5 | **8.1** | **2.2** | 2.5 |
-| s3_actions | 7.0 | **6.6** | **2.2** | 2.5 |
-| chinese | 37.7 | **24.4** | **2.2** | 2.5 |
-| japanese | 48.6 | **27.3** | **2.3** | 2.5 |
+| english | 6.6 | **6.5** | **2.5** | 2.8 |
+| german | 7.8 | **7.5** | **2.9** | 3.0 |
+| l33t | 7.9 | **7.2** | **2.2** | 2.5 |
+| french | 8.4 | 8.4 | **2.6** | 2.9 |
+| greek | 9.0 | **8.7** | **2.3** | 2.7 |
+| arabic | **9.3** | 9.7 | **2.3** | 2.6 |
+| hebrew | **9.5** | 9.6 | **2.2** | 2.5 |
+| hindi | **8.8** | 9.1 | **2.2** | 2.5 |
+| georgian | 8.4 | 8.4 | **2.2** | 2.5 |
+| s3_actions | 6.7 | 6.7 | **2.2** | 2.5 |
+| chinese | 40.4 | **24.4** | **2.3** | 2.5 |
+| japanese | 51.2 | **27.5** | **2.3** | 2.5 |
 
 Present-key lookups are level with the stdlib `Dict` across every corpus with
 keys of an ordinary size, and misses are consistently a little faster — the
@@ -171,28 +171,55 @@ across ten inserts measures the constructor, not the insert.
 | corpus | build a map | | count word frequencies | |
 | --- | --- | --- | --- | --- |
 | | StringDict | stdlib | StringDict | stdlib |
-| english | 14.5 | **10.0** | **11.7** | 18.2 |
-| german | 14.9 | **10.9** | **12.6** | 19.5 |
-| l33t | 11.6 | **7.3** | **10.8** | 11.0 |
-| french | 12.0 | **7.2** | 12.0 | **11.2** |
-| greek | 11.6 | **7.5** | 11.0 | **10.9** |
-| arabic | 12.0 | **7.5** | **11.2** | 11.3 |
-| hebrew | 10.0 | **7.1** | **9.4** | 10.3 |
-| hindi | 11.6 | **7.9** | **11.1** | 12.2 |
-| georgian | 10.9 | **7.3** | **10.3** | 10.6 |
-| s3_actions | 6.0 | **3.8** | 6.2 | **5.1** |
-| chinese | 1.2 | **0.4** | 1.3 | **0.7** |
-| japanese | 1.3 | **0.4** | 1.5 | **0.8** |
+| english | 14.5 | **9.9** | **11.0** | 18.5 |
+| german | 14.4 | **10.9** | **11.9** | 19.7 |
+| l33t | 10.3 | **7.4** | **9.3** | 11.0 |
+| french | 10.4 | **7.4** | **10.4** | 11.2 |
+| greek | 10.5 | **7.5** | **10.1** | 11.1 |
+| arabic | 10.5 | **7.5** | **10.1** | 11.1 |
+| hebrew | 9.1 | **7.1** | **8.6** | 10.4 |
+| hindi | 10.6 | **7.8** | **10.0** | 12.1 |
+| georgian | 9.9 | **7.3** | **9.5** | 10.6 |
+| s3_actions | 5.4 | **3.8** | 5.6 | **5.3** |
+| chinese | 1.1 | **0.4** | 1.3 | **0.7** |
+| japanese | 1.2 | **0.5** | 1.5 | **0.8** |
 
-Inserting is about 1.5× slower than the stdlib `Dict`, and that is the standing
+Inserting is about 1.4× slower than the stdlib `Dict`, and that is the standing
 weakness. Each `put` touches four separate allocations — the packed key bytes,
 the end offsets, the slot table and the values — where a `Dict` appends one
 entry to one array.
 
-Word counting is the workload where that reverses: on english and german, where
-999 words collapse to about 200 distinct ones, `upsert` runs a single probe per
-word and comes out 35% ahead of a `Dict`'s read-then-write pair. Where a corpus
-is nearly all distinct words, the two are level and the insert cost decides.
+Word counting is where that reverses, and it now does so on ten of the twelve
+corpora. `upsert` settles a word in one probe against a `Dict`'s read-then-write
+pair, which is worth 40% on english and german — 999 words collapsing to about
+200 distinct ones, so almost every word is an update — and 5–20% elsewhere.
+Only the two CJK corpora and s3_actions, where nearly every word is distinct and
+the insert cost decides, come out behind.
+
+### Deletion support is close to free
+
+`destructive` is on by default; turning it off removes `delete`, `pop` and
+`clear`, and with them one bit per entry. Measured one variant per process
+(`pixi run bench-destructive` and `pixi run bench-non-destructive`), at 28000
+twelve-byte keys:
+
+| | destructive=True | destructive=False |
+| --- | --- | --- |
+| insert | 19.8 ns | 20.2 ns |
+| lookup, hit | 17.4 ns | 17.8 ns |
+| lookup, miss | 3.7 ns | 3.8 ns |
+| footprint | 995909 bytes | 991813 bytes |
+
+Reads are unaffected by design: a tombstoned slot is excluded from a lookup by
+its control byte, which no longer matches any 7-bit tag, so probing never
+consults the mask. The mask exists for iteration, which walks entries rather
+than slots.
+
+Inserts used to pay 19% for deletion support. That was not the bit — it was the
+mask's bounds check sitting behind a `@no_inline` call, so every insert paid for
+a call to learn the mask was already big enough. With the check hoisted into the
+caller, the two variants are level and the only remaining cost is the 4096 bytes
+of mask, 0.4% of the map.
 
 ### Memory
 
@@ -218,8 +245,10 @@ control byte replaced the cached hash.
 ## Development
 
 ```bash
-pixi run test     # the test suite (47 tests)
+pixi run test     # the test suite (48 tests)
 pixi run bench    # the benchmarks above
+pixi run bench-destructive      # the destructive=True variant, alone
+pixi run bench-non-destructive  # the destructive=False variant, alone
 pixi run main     # the example
 pixi run format   # mojo format
 pixi run docs     # docstring check

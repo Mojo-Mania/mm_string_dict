@@ -10,6 +10,8 @@ version = "0.1.0"
 test = "mojo -I . test/test_string_dict.mojo"
 main = "mojo -I . examples/main.mojo"
 bench = "mojo -D ASSERT=none -I . benchmarks/bench_string_dict.mojo"
+bench-destructive = "mojo -D ASSERT=none -D DESTRUCTIVE=true -I . benchmarks/bench_destructive.mojo"
+bench-non-destructive = "mojo -D ASSERT=none -D DESTRUCTIVE=false -I . benchmarks/bench_destructive.mojo"
 format = "mojo format ./"
 docs = "mojo doc --diagnose-missing-doc-strings -o /dev/null mm_string_dict/"
 

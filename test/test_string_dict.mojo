@@ -644,5 +644,40 @@ def test_corpus_keys_are_stored_end_to_end() raises:
     )
 
 
+def test_tombstones_survive_mask_growth() raises:
+    """Deletes while the mask is still growing, then checks every bit.
+
+    The tombstone mask is reallocated as entries accumulate, so a bit set early
+    has to be carried across several reallocations. Deleting as we insert,
+    rather than after, is what puts bits below the mask's current end before it
+    grows again.
+    """
+    var dict = StringDict[Int]()
+    var live = Dict[String, Int]()
+    for i in range(5000):
+        var key = String("key-", i)
+        dict[key] = i
+        live[key] = i
+        if i % 7 == 0:
+            dict.delete(key)
+            _ = live.pop(key)
+
+    assert_equal(len(dict), len(live))
+    for i in range(5000):
+        var key = String("key-", i)
+        if i % 7 == 0:
+            assert_false(key in dict, key)
+        else:
+            assert_equal(dict.get(key, -1), i, key)
+
+    # Iteration walks entries and consults the mask directly, so it is the
+    # reader that a lost bit would show up in.
+    var seen = 0
+    for entry in dict.items():
+        assert_equal(live.get(String(entry.key), -1), entry.value)
+        seen += 1
+    assert_equal(seen, len(live))
+
+
 def main() raises:
     TestSuite.discover_tests[__functions_in_module()]().run()
