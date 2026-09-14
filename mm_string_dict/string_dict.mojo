@@ -31,12 +31,18 @@ from std.memory import (
     unsafe_uninit_move_n,
 )
 from std.memory.alloc import Allocation, alloc, dealloc
+from std.sys import get_defined_int
 from std.sys.info import align_of, simd_width_of, size_of
 
 
-comptime GROUP = simd_width_of[DType.uint8]()
-"""How many slots one SIMD compare covers, chosen for the target: 16 with
-NEON, 32 with AVX2, 64 with AVX-512."""
+comptime GROUP = get_defined_int[
+    "GROUP", min(simd_width_of[DType.uint8](), 32)
+]()
+"""How many slots one SIMD compare covers: the target's width, capped at 32 --
+16 with NEON, 32 with AVX2 and with AVX-512. A 64-lane group was slower than 32
+on every benchmark on an AVX-512 machine, and it sets a 64-slot floor on every
+table. `-D GROUP=n` overrides it, for comparing widths on one machine; it must
+be a power of two."""
 
 
 def _lane_indices() -> SIMD[DType.uint8, GROUP]:

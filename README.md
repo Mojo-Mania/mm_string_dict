@@ -15,7 +15,7 @@ array, with a **control byte** per slot holding either "empty", "deleted", or
 seven bits of the key's hash. Those seven bits come from the opposite end of
 the hash to the bits that choose the slot, so they are independent of it, and a
 probe compares a whole group of them at once — `simd_width_of[uint8]()` slots
-per instruction, which is 16 with NEON and 32 with AVX2.
+per instruction, capped at 32: 16 with NEON, 32 with AVX2 and AVX-512.
 
 ```mojo
 from mm_string_dict import StringDict
@@ -46,6 +46,10 @@ stdlib slot is 40 bytes before any key data (an 8-byte hash, a 24-byte `String`,
 an 8-byte value), and a key longer than 23 bytes gets a heap allocation of its
 own on top. Here a key costs its bytes, four bytes of end offset, four of cached
 hash, and nothing else.
+
+The timings below are from Apple silicon. On x86-64 with AVX-512 the memory
+figures hold, but lookups and builds trail the stdlib — see
+*Linux x86-64 (AVX-512)*.
 
 **Reach for it when:**
 
@@ -143,7 +147,9 @@ StringDict[Int, DType.uint32, DType.uint32, True, True]   # cache full hashes to
 ## Performance
 
 Apple M-series, release build (`-D ASSERT=none`, which is what the `bench` tasks
-pass), against the stdlib `Dict[String, Int]`.
+pass), against the stdlib `Dict[String, Int]`. The same suite on an x86-64
+machine is further down, under *Linux x86-64 (AVX-512)*, and it does not tell
+the same story.
 
 The keys are real words. `corpora/` holds twelve word lists — Latin, Greek,
 Hebrew, Arabic, Georgian, Devanagari and CJK scripts, plus a list of AWS S3
@@ -379,6 +385,201 @@ everywhere, and this one is not.
 | `KeyCountType` | `uint32` | Narrower shrinks the slot index *and* the cached hash: `uint16` is 12% smaller overall at no measurable cost in time. `put` aborts if entries exceed what it can index. |
 | `KeyOffsetType` | `uint32` | Caps the total size of all keys together. |
 
+### Linux x86-64 (AVX-512)
+
+The same suite on an AMD Ryzen AI 9 HX 370 (Zen 5, AVX-512), Arch Linux, Mojo
+1.2.0.dev2026091205, `performance` power profile. Every task ran twice, one after
+another, and each figure is the lower of the two runs; they agreed within a few
+percent, apart from one greek build. A different CPU makes the nanoseconds
+incomparable with the Apple tables — what carries over is where each container
+stands against the stdlib `Dict` on the same machine.
+
+These tables were measured with a **64-lane group**, the full AVX-512 register,
+which is what the default was before *Group width* below showed 32 to be faster
+here; the default is now capped at 32. At 64 a probe compares 64 control bytes
+per step, and no table is smaller than 64 slots.
+
+| | Apple M-series | x86-64, AVX-512 |
+| --- | --- | --- |
+| memory, all twelve corpora | 125212 B | 126329 B |
+| `uint16` index saves | 12% | 12% |
+| lookup, word present | level with the stdlib | 1.1–1.3× the stdlib |
+| lookup, absent | a little faster | 1.3–2.0× the stdlib |
+| index a whole corpus | ~1.15× the stdlib | 1.3–1.8× the stdlib |
+| count word frequencies | faster on 11 of 12 | faster on 3 of 12 |
+| map per 20-word document | **573** vs 851 ns | **383** vs 512 ns |
+| footprint of that map | 712 B | 1928 B |
+
+**The memory case survives the move; the speed case does not.** Across whole
+corpora the footprint is within 1% of the Apple figure, and narrowing the index
+saves the same 12%. Timings are another matter: lookups and builds trail the
+stdlib on every corpus, and misses — the fastest path on Apple silicon — trail
+it by the most.
+
+#### Memory
+
+Bytes for a map holding every distinct word, from `bench-narrow`. The stdlib
+column of the Apple table has no benchmark behind it in this repository, so it
+is not repeated here.
+
+| corpus | keys | uint32 | uint16 | Apple, uint32 |
+| --- | --- | --- | --- | --- |
+| english | 192 | 6050 | **5098** | 6003 |
+| german | 208 | 6628 | **5676** | 7627 |
+| l33t | 339 | 12372 | **10356** | 12085 |
+| french | 418 | 14539 | **12523** | 13192 |
+| greek | 320 | 11867 | **10187** | 14853 |
+| arabic | 336 | 14539 | **12523** | 14853 |
+| hebrew | 231 | 10567 | **8887** | 10752 |
+| hindi | 250 | 13817 | **12137** | 12413 |
+| georgian | 250 | 13817 | **12137** | 12413 |
+| s3_actions | 143 | 7603 | **6803** | 7848 |
+| chinese | 10 | 7265 | **7009** | 5341 |
+| japanese | 10 | 7265 | **7009** | 7832 |
+| **all twelve** | | 126329 | **110345** | 125212 |
+
+Individual corpora move both ways, because a wider group shifts where the table
+doubles. Only the ten-key CJK maps are consistently bigger: they sit at the
+64-slot floor.
+
+#### Lookups
+
+Nanoseconds per lookup, probing with independently allocated strings as above.
+
+| corpus | every word, present | | probe from another script | |
+| --- | --- | --- | --- | --- |
+| | StringDict | stdlib | StringDict | stdlib |
+| english | 9.0 | **7.3** | 5.2 | **2.9** |
+| german | 9.8 | **7.8** | 6.2 | **3.1** |
+| l33t | 9.3 | **7.4** | 4.7 | **2.7** |
+| french | 10.1 | **7.9** | 5.4 | **2.9** |
+| greek | 12.1 | **9.5** | 4.9 | **2.7** |
+| arabic | 11.3 | **8.9** | 4.8 | **2.7** |
+| hebrew | 11.1 | **8.8** | 4.1 | **2.7** |
+| hindi | 17.0 | **14.3** | 4.4 | **2.6** |
+| georgian | 14.6 | **12.4** | 4.3 | **2.7** |
+| s3_actions | 18.2 | **15.9** | 4.7 | **2.6** |
+| chinese | 35.1 | **30.8** | 3.4 | **2.7** |
+| japanese | 37.1 | **32.6** | 3.5 | **2.7** |
+
+A miss with the table 85% full costs 5.3 ns against the stdlib's 3.3.
+`caching_hashes=False` changes none of this by more than a few percent.
+
+#### Building
+
+Microseconds for a whole corpus.
+
+| corpus | index every word | | count word frequencies | |
+| --- | --- | --- | --- | --- |
+| | StringDict | stdlib | StringDict | stdlib |
+| english | 16.3 | **10.2** | **13.2** | 17.6 |
+| german | 16.6 | **11.4** | **13.9** | 19.1 |
+| l33t | 12.4 | **7.1** | 12.7 | **9.8** |
+| french | 12.6 | **7.3** | 13.6 | **9.8** |
+| greek | 12.2 | **8.1** | 12.7 | **11.0** |
+| arabic | 12.1 | **8.0** | 12.6 | **10.6** |
+| hebrew | 10.8 | **7.1** | 10.9 | **9.5** |
+| hindi | 13.8 | **10.5** | **13.7** | 14.8 |
+| georgian | 11.6 | **8.1** | 11.8 | **10.8** |
+| s3_actions | 5.3 | **4.1** | 5.7 | **5.0** |
+| chinese | 0.6 | **0.4** | 0.8 | **0.7** |
+| japanese | 0.6 | **0.4** | 0.9 | **0.7** |
+
+`upsert` still wins clearly on english and german, where each distinct word
+occurs about five times, and narrowly on hindi; it loses on the other nine.
+
+#### Where an insert's time goes
+
+| | StringDict | stdlib | Apple, StringDict vs stdlib |
+| --- | --- | --- | --- |
+| construct + destruct, empty | 13.5 ns | **0.2 ns** | 38.5 vs 0.3 |
+| put, steady state | **15.3 ns** | 15.9 ns | 10.3 vs 12.3 |
+| insert, 4000 keys, pre-sized | **14.9 ns** | 18.8 ns | 10.0 vs 10.5 |
+| insert, 4000 keys, growing from empty | 38.3 ns | **26.3 ns** | 19.1 vs 19.4 |
+| → so growth costs | 23.4 ns | **7.5 ns** | 9.1 vs 8.9 |
+
+This is the clearest result on this machine, and it points at one place. **A
+pre-sized insert beats the stdlib by 21%; growth costs three times what the
+stdlib's does.** And the hash cache, which closed the growth gap on Apple
+silicon, does nothing for it here: growth is 23.2 ns with `caching_hashes=False`
+against 23.4 with it on. So growth on this machine is not paying for hashing.
+Part of it is the group width: at 32 lanes growth drops to 19.1 ns (see *Group
+width*), but that is still twice the stdlib's, and the rest has not been
+isolated.
+
+The practical consequence is the same as before, with more weight: **if you know
+the size, pass `capacity=n`**, and on this machine that is the difference
+between trailing the stdlib and beating it.
+
+#### Many small maps
+
+Twenty-word documents, one configuration per process; nanoseconds per document.
+
+| document | StringDict | stdlib |
+| --- | --- | --- |
+| 5 words | 140 | **126** |
+| 20 words | **383** | 512 |
+| 100 words | 2438 | **2030** |
+
+| configuration | ns per 20-word document | footprint |
+| --- | --- | --- |
+| `uint32` + cache (the default) | 383 | 1928 B |
+| `uint16` + cache | 384 | 1672 B |
+| `uint8` + cache | 387 | 1608 B |
+| `uint32`, `caching_hashes=False` | 381 | 1672 B |
+| `uint8`, `caching_hashes=False` | 400 | **1480 B** |
+
+Twenty-word documents are still a clear win, but five and a hundred are not. A
+small map takes 2.7× the bytes it does on Apple silicon, and all of that is
+the 64-slot floor: built with `-D GROUP=16`, the same map is 712 B, exactly the
+Apple figure. And the Apple finding that the cache earns its place on
+small maps does not reproduce: with it off the time is within noise. On this
+machine, if a small map needs to be smaller, narrowing the index and dropping
+the cache are each free on their own; together they save 23% for about 4% in
+time.
+
+#### Group width
+
+The group used to default to the widest SIMD register the target has — 64 lanes
+here. It is now capped at 32 because of this table, and `-D GROUP=n` overrides
+it. The same benchmarks at 64, 32 and 16 lanes, the three widths
+interleaved over two rounds, lower of the two; the 55 tests pass at all three.
+
+| | 64 (old default) | 32 (default) | 16 | stdlib |
+| --- | --- | --- | --- | --- |
+| index english, µs | 16.1 | **14.8** | 19.1 | 10.3 |
+| index french, µs | 12.5 | **10.7** | 13.8 | 7.4 |
+| count english, µs | 13.3 | **12.1** | 15.7 | 17.7 |
+| hit, english, ns | 9.1 | **8.6** | 11.1 | 7.3 |
+| hit, hindi, ns | 17.0 | **16.3** | 20.6 | 14.3 |
+| miss, english, ns | 5.2 | **3.9** | 4.5 | 2.9 |
+| miss, german, ns | 6.2 | **4.4** | 5.6 | 3.1 |
+| miss, table 85% full, ns | 5.3 | **4.1** | 5.7 | 3.3 |
+| put, steady state, ns | 15.2 | **14.3** | 17.8 | 15.9 |
+| insert, pre-sized, ns | 14.7 | **12.6** | 15.3 | 18.0 |
+| → growth, ns per insert | 23.1 | **19.1** | 25.7 | 8.2 |
+| 20-word document, ns | 389 | **338** | 666 | 504 |
+| 20-word document, bytes | 1928 | 968 | **712** | |
+
+**On this CPU, 32 lanes is better than 64 on every timed row**: misses 20–29%
+faster on the word corpora (6–8% on the CJK pair), hits 4–7%, builds 7–14%,
+growth 17%, and a small map at half the bytes.
+Word counting then beats the stdlib on four corpora and is level on two more,
+against three at 64. Sixteen lanes is not better still — it is the slowest on
+nearly everything, and a 20-word document costs twice what it does at 32, which
+is the opposite of Apple silicon, where 16 is the native width and small maps
+beat the stdlib at it.
+
+The width is not the whole gap. At 32, hits still trail the stdlib by 1.1–1.2×,
+builds by 1.2–1.5×, and growth by 2×.
+
+#### Deletion support
+
+`destructive=True` against `False`, one per process: builds, hits and misses are
+identical to the tenth of a nanosecond on every corpus, and at 28000 keys the
+tombstone mask is 3594 bytes of a 964796-byte map (0.4%). As on Apple silicon,
+it is free.
+
 ## Development
 
 ```bash
@@ -386,7 +587,7 @@ pixi run test                   # the test suite (55 tests)
 pixi run main                   # the example
 pixi run format                 # mojo format
 pixi run docs                   # docstring check
-pixi build                      # the conda package (needs pixi >= 0.80)
+pixi build                      # the conda package
 
 pixi run bench                  # the corpus tables above
 pixi run bench-small-maps       # one map per document
@@ -401,6 +602,13 @@ pixi run bench-non-destructive  # destructive=False, likewise
 pixi run bench-uncached         # the corpus tables with caching_hashes off
 pixi run bench-anatomy-uncached # the anatomy with caching_hashes off
 ```
+
+To try another SIMD group width, add `-D GROUP=32` (or 16) to any `mojo`
+command; see *Group width*.
+
+Every task needs pixi 0.80 or newer. `pixi.lock` is a version 7 lock file, and
+an older pixi does not refuse it — it treats the lock as missing and rewrites
+it.
 
 ## Provenance
 
