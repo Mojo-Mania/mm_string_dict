@@ -49,6 +49,30 @@ corpora, 4-7 bytes an entry, at **no measurable cost in time**. At 51% of a
 buys, and it is the right configuration for any dictionary that will not reach
 65535 keys.
 
+### Does the cache pay on a small map?
+
+A map of twenty entries rehashes twice, so there is almost nothing for a hash
+cache to save, and turning it off looked like the obvious economy. It is not.
+On the per-document workload, one configuration per process:
+
+| configuration | ns per 20-word document | footprint |
+| --- | --- | --- |
+| `uint32` + cache (default) | 573 | 712 B |
+| `uint16` + cache | 571 | 600 B |
+| `uint8` + cache | 582 | 568 B |
+| `uint32`, cache off | 642 | 616 B |
+| `uint8`, cache off | 613 | 520 B |
+
+The cache is worth 11% even here -- 565/573/585 against 641/643/652 over three
+pairs -- which is more than the two rehashes' worth of hashing can explain on
+its own. With the cache off, `_rehash` does not merely hash again; it rebuilds
+each key's slice from the offset array first, and that is the larger half.
+
+And narrowing the index saves more memory than dropping the cache does, for
+nothing: `uint8` with the cache is both smaller and faster than `uint32`
+without it. The parameter to reach for first, on a map whose size is known, is
+`KeyCountType`.
+
 ### A note on measuring this one
 
 The first comparison ran both index widths in one process and reported lookups

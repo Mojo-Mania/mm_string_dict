@@ -325,9 +325,29 @@ Nanoseconds per document.
 
 | document | StringDict | stdlib |
 | --- | --- | --- |
-| 5 words | **176** | 210 |
-| 20 words | **524** | 857 |
-| 100 words | **1976** | 2908 |
+| 5 words | **197** | 200 |
+| 20 words | **573** | 851 |
+| 100 words | **2132** | 2786 |
+
+A map per document is also where the two tuning parameters are easiest to
+reason about, since a document's vocabulary is small and known. Twenty-word
+documents, one configuration per process:
+
+| configuration | ns per document | footprint |
+| --- | --- | --- |
+| `uint32` + cache (the default) | 573 | 712 B |
+| `uint16` + cache | 571 | 600 B |
+| `uint8` + cache | 582 | **568 B** |
+| `uint32`, `caching_hashes=False` | 642 | 616 B |
+| `uint8`, `caching_hashes=False` | 613 | 520 B |
+
+Two things fall out, and both are the opposite of what seems obvious at this
+size. **The hash cache still earns its place**, worth 11% even on a map of
+twenty entries that rehashes twice — measured three times, 565/573/585 against
+641/643/652. And **narrowing the index saves more memory than dropping the cache
+does**, at no cost in time: `uint8` with the cache is smaller *and* faster than
+`uint32` without it. If a small map needs to be smaller, narrow
+`KeyCountType` before reaching for `caching_hashes=False`.
 
 ### Where an insert's time goes
 
@@ -370,6 +390,9 @@ pixi build                      # the conda package (needs pixi >= 0.80)
 
 pixi run bench                  # the corpus tables above
 pixi run bench-small-maps       # one map per document
+pixi run bench-small-maps-16    #   ... with a uint16 index
+pixi run bench-small-maps-8     #   ... with a uint8 index
+pixi run bench-small-maps-plain #   ... with caching_hashes off
 pixi run bench-narrow           # KeyCountType uint32, alone
 pixi run bench-narrow-16        # KeyCountType uint16, alone
 pixi run bench-anatomy          # where an insert's time goes
