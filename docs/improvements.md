@@ -172,10 +172,40 @@ to level at 5 words and 25% ahead at 20 and above, and whole-corpus word
 counting now wins on ten of the twelve corpora, english by 84%.
 
 **Still open:** `keys_end` could join the entry block, but only by dissolving
-`KeysContainer` as a standalone type. And the locality idea is unchanged and
-still untried: `keys_end[i]` and `values[i]` are written on the same insert and
-read together on any lookup returning a value, and interleaving those two would
-put both on one cache line.
+`KeysContainer` as a standalone type -- and the reason for wanting it there has
+since evaporated, see below.
+
+### Killed by measurement: interleaving the end offset with the value
+
+This was the most promising remaining idea in this document, and it was wrong.
+The claim: `keys_end[i]` and `values[i]` are written on the same insert and read
+together on any lookup that returns a value, from two separate arrays, so
+interleaving them into one record would put both on one cache line.
+
+Both halves fail to measure, on maps far too large to cache. Comparing
+`key in map` against `map.get(key)` isolates the value load:
+
+| | 1000 keys | 28000 keys | 200000 keys |
+| --- | --- | --- | --- |
+| `key in map` | 10.5 ns | 13.4 ns | 16.4 ns |
+| `map.get(key)` | 10.6 ns | 13.8 ns | 16.5 ns |
+| so the value load costs | 0.1 ns | 0.4 ns | 0.1 ns |
+
+It is nearly free because it is not on the critical path: by the time it
+happens the lookup has already read two end offsets and compared the key bytes,
+and the load overlaps with all of that.
+
+The write side is no better. Shrinking the value type from 8 bytes to 1 -- which
+cuts the value array at 28000 entries from 224KB to 28KB, eight times fewer
+cache lines touched -- leaves the insert at **4.7 ns either way**, unchanged to
+the tenth of a nanosecond.
+
+And it would cost memory in the one dimension this container exists for. A
+record of `{UInt32, Int}` is 16 bytes where the two arrays are 12, and
+`{UInt32, UInt8}` is 8 where they are 5: 4 and 3 bytes of padding per entry, a
+third to three fifths more for those arrays, around 11% of a whole map.
+
+Nothing measurable gained, paid for in footprint. Not built.
 
 ### Killed by measurement: dropping a redundant zero-fill
 
@@ -237,13 +267,10 @@ Item 1 covers what merging them is and is not worth. The short version: it buys
 back part of a 269.6 ns constructor and nothing per insert, and deferring the
 allocations entirely buys back more of it than merging does.
 
-One part of the merge does stand on its own, though, and is not about
-allocation count: the end offset and the value for an entry are written on
-every insert and read together whenever a lookup returns a value, and they sit
-in two separate arrays. Interleaving them into a single entry array would put
-both on one cache line. That is a locality change rather than an allocator one,
-and unlike the rest of the merge it could plausibly move the steady-state
-number.
+One part of the merge looked like it stood on its own -- interleaving an
+entry's end offset with its value, so both land on one cache line. It was
+measured and does not pay; see "Killed by measurement: interleaving the end
+offset with the value" under item 1.
 
 ## 5. Smaller items
 
