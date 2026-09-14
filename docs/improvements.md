@@ -133,47 +133,59 @@ for a map that receives even one insert, while a cheaper constructor helps
 every one of them. Per-document counting went from losing to the stdlib `Dict`
 at 20 words to winning by 16%, and by 15% at 100 words.
 
-**The entry family is merged too.** `keys_end` stays where it is, inside
-`KeysContainer`, which is a standalone type with its own lifecycle. The other
-three -- the cached hashes, the values and the tombstone mask -- now share one
-block with a single `entry_capacity`. That meant giving up `List[V]` for raw
-storage: growth moves the values with `unsafe_uninit_move_n`, the destructor
-runs `unsafe_destroy_n` over every entry ever added (deleted ones included,
-since entries are never renumbered), and the copy constructor copies them one
-by one while the hashes and mask go by `memcpy`.
+**The entry family is merged too, and the keys with it.** Everything indexed by
+entry -- the cached hashes, the key end offsets, the values and the tombstone
+mask -- now shares one block with a single `entry_capacity`. `KeysContainer` is
+gone: the packed key bytes are a field of the map, and the end offsets that used
+to live beside them moved into the entry block, where they belong.
 
-The block is allocated as `UInt64` rather than as bytes, which is what gives
-the hash region its 8-byte alignment: the installed `Layout` has no
-explicit-alignment constructor, and a byte allocation promises nothing. Values
-follow at a multiple of 8, so any `V` aligned to 8 or less is satisfied, and a
-`comptime assert` rejects the rest.
+The split is by growth trigger, which is the only thing that separates these
+regions. Three allocations per map:
 
-Four allocations per map now, from seven at the start:
+| | holds | grows when |
+| --- | --- | --- |
+| key buffer | every key's bytes, end to end | the bytes run out |
+| entry block | end offsets, hashes, values, mask | the entry count runs out |
+| slot block | control bytes, slot to entry index | the table passes 7/8 load |
 
-| | 7 allocs | 5 allocs | 4 allocs |
-| --- | --- | --- | --- |
-| construct + destruct, empty | 269.6 ns | 188.2 ns | **170.0 ns** |
-| per-document count, 5-word docs | 337 ns | 255 ns | **209 ns** |
-| per-document count, 20-word docs | 839 ns | 699 ns | **623 ns** |
-| per-document count, 100-word docs | 2756 ns | 2429 ns | **2208 ns** |
-| index the english corpus | 15.0 us | 15.0 us | **13.0 us** |
-| insert, pre-sized | 11.0 ns | 11.0 ns | **10.0 ns** |
-| put, steady state | 11.3 ns | 11.3 ns | **10.5 ns** |
+The entry regions had been on *two* schedules by accident -- `keys_end` grew by
+half inside `KeysContainer` while the rest doubled, and a floor meant to pair
+them almost never bound. Tracing a build showed them interleaving rather than
+coinciding: 16/24/36/54/81 against 16/32/64/128. There is exactly one entry per
+key, so one capacity always sufficed; they now grow by half together, which is
+also a third less overshoot than doubling on the regions that carry most of what
+an entry costs.
 
-The second merge did what the first one could not: it moved the *insert* path,
-not just the constructor. A pre-sized insert is now 10.0 ns against the stdlib
-`Dict`'s 11.2, having been behind, and corpus builds came down 8-13%. Three
-separate capacity checks per insert -- the values `List`, the mask, the hash
-array -- became one, and the three regions an insert writes now sit in one
-allocation instead of three.
+Giving up `List[V]` for raw storage is what made this possible: growth moves the
+values with `unsafe_uninit_move_n`, the destructor runs `unsafe_destroy_n` over
+every entry ever added (deleted ones included, since entries are never
+renumbered), and the copy constructor copies them one by one while the offsets,
+hashes and mask go by `memcpy`. The block is allocated as `UInt64` rather than
+as bytes, which is what gives the hash region its 8-byte alignment -- the
+installed `Layout` has no explicit-alignment constructor and a byte allocation
+promises nothing -- and the value region is rounded up to `align_of[V]()`, which
+matters when the end offsets are narrower than the values.
 
-Against the stdlib `Dict`, per-document counting went from losing at every size
-to level at 5 words and 25% ahead at 20 and above, and whole-corpus word
-counting now wins on ten of the twelve corpora, english by 84%.
+Three allocations per map now, from seven at the start:
 
-**Still open:** `keys_end` could join the entry block, but only by dissolving
-`KeysContainer` as a standalone type -- and the reason for wanting it there has
-since evaporated, see below.
+| | 7 allocs | 5 | 4 | 3 |
+| --- | --- | --- | --- | --- |
+| per-document count, 5-word docs | 337 ns | 255 | 216 | **169** |
+| per-document count, 20-word docs | 839 ns | 699 | 608 | **519** |
+| per-document count, 100-word docs | 2756 ns | 2429 | 2177 | **1961** |
+| index the english corpus | 15.0 us | 15.0 | 13.1 | **12.9** |
+
+Against the stdlib `Dict`, per-document counting began this sequence losing at
+every size and now wins at every size: 169 ns against 204 at five words, 519
+against 834 at twenty, 1961 against 2823 at a hundred.
+
+**What it cost.** An insert into a map that never grows went from 10.0 ns to
+11.4, about 14%. Hoisting the region pointers in `put` -- the same fix the slot
+merge needed -- recovered part of it but not all; what is left is presumably
+more of the same, four regions in one allocation being harder for the compiler
+to keep un-aliased than four separate ones. It is a good trade at any realistic
+size: a twenty-word document pays 28 ns of extra inserts against roughly 120 ns
+of constructor it no longer pays, and whole-corpus builds are unchanged.
 
 ### Killed by measurement: interleaving the end offset with the value
 

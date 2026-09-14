@@ -63,7 +63,10 @@ def bench_fixed_cost() raises:
 
     def ours() raises:
         var map = Map()
-        keep(len(map))
+        # `len` is a constant zero here, and keeping only that lets the
+        # optimizer delete the allocations outright -- it then reports 0.3 ns.
+        # Keeping the block's address forces them to happen.
+        keep(Int(map.entries))
 
     def theirs() raises:
         var map = Dict[String, Int]()
@@ -74,8 +77,8 @@ def bench_fixed_cost() raises:
     print("  ----------------------------------------------------")
     line("construct + destruct, empty", measure(ours), measure(theirs), "ns")
     print("")
-    print("   A `StringDict` allocates four times in its constructor -- packed")
-    print("   keys, end offsets, the slot block and the entry block. A `Dict`")
+    print("   A `StringDict` allocates three times in its constructor -- the")
+    print("   key bytes, the entry block and the slot block. A `Dict`")
     print("   allocates nothing until its first insert, which is the whole of")
     print("   the difference.")
 

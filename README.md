@@ -193,9 +193,11 @@ much of that difference is `_rehash` recomputing a hash for every entry it moves
 where the stdlib reuses a stored one.
 
 Small maps are a different story, and a good one. One map per document — the
-shape of a term-frequency or grouping pass — runs **623 ns per 20-word document
-against the stdlib's 831**, 25% ahead, and holds that margin at 100 words. An
-empty map costs 170 ns to build and tear down, four allocations' worth.
+shape of a term-frequency or grouping pass — runs **519 ns per 20-word document
+against the stdlib's 834**, and beats it at every size measured: 169 ns against
+204 at five words, 1961 against 2823 at a hundred. A map costs three
+allocations, split by what makes each one grow: the key bytes when the bytes run
+out, the entry block when the entry count does, the slot table at 7/8 load.
 
 Two switches address the growth cost. If you know the size up front,
 `StringDict[Int](capacity=n)` removes the growth entirely. Otherwise

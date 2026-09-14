@@ -66,17 +66,23 @@ comptime _MIN_KEYS = 8
 
 @always_inline
 def _entry_block[
-    V: AnyType, caching_hashes: Bool, destructive: Bool
-](capacity: Int) -> Tuple[Int, Int, Int]:
-    """Byte offsets of the value and mask regions, and the block's total size.
+    V: AnyType, KeyEndType: DType, caching_hashes: Bool, destructive: Bool
+](capacity: Int) -> Tuple[Int, Int, Int, Int]:
+    """Byte offsets of each entry region, and the block's total size.
 
-    The three entry-indexed regions share one allocation. Hashes go first, at
-    offset zero, so their 8-byte alignment comes free from the block's own;
-    their region is a whole number of 8-byte words, so the values that follow
-    land on an offset the allocator's alignment already satisfies.
+    Every region here is indexed by entry, and there is exactly one entry per
+    key, so one capacity serves all four and they grow in a single step. The
+    packed key bytes are the exception and live in their own buffer: they grow
+    when the bytes run out, which has nothing to do with the entry count.
+
+    Regions are laid out most-aligned first. Hashes are 8-byte and start at
+    zero, so they need nothing; the end offsets that follow are at a multiple
+    of 8; the values are then rounded up to their own alignment, which matters
+    when the offsets are narrower than the values.
 
     Parameters:
         V: The value type.
+        KeyEndType: The type of a key end offset.
         caching_hashes: Whether a hash region is present.
         destructive: Whether a tombstone mask is present.
 
@@ -84,17 +90,21 @@ def _entry_block[
         capacity: The number of entries the block must hold.
 
     Returns:
-        The value offset, the mask offset, and the total size in bytes.
+        The offsets of the end-offset, value and mask regions, and the total
+        size in bytes.
     """
-    var values = 0
+    var ends = 0
     comptime if caching_hashes:
-        values = capacity * size_of[UInt64]()
+        ends = capacity * size_of[UInt64]()
+    var values = ends + capacity * size_of[Scalar[KeyEndType]]()
+    comptime VALIGN = align_of[V]()
+    values = ((values + VALIGN - 1) // VALIGN) * VALIGN
     var mask = values + capacity * size_of[V]()
     var total = mask
     comptime if destructive:
         total += (capacity + 7) >> 3
     # An allocation of nothing is still a pointer that must be free-able.
-    return (values, mask, total if total > 0 else 1)
+    return (ends, values, mask, total if total > 0 else 1)
 
 
 @always_inline
@@ -124,219 +134,7 @@ def _slot_block_count[KeyCountType: DType](capacity: Int) -> Int:
 # reach, so wider types pay nothing for the check. Narrower ones are opt-in and
 # genuinely reachable.
 comptime _CHECKED_INDEX_BITS = 32
-"""The smallest key capacity a `KeysContainer` will allocate."""
-
-
-struct KeysContainer[KeyEndType: DType = .uint32](ImplicitlyCopyable, Sized):
-    """Stores many strings in one byte buffer, addressed by index.
-
-    Keys are appended end to end and delimited by a parallel array of end
-    offsets, so key `i` occupies `keys[end[i - 1] .. end[i]]`. That costs one
-    offset per key instead of a `String` header and an allocation each.
-
-    Parameters:
-        KeyEndType: The unsigned integer type holding the end offsets. It caps
-            the total size of all keys together: `uint32` allows 4GB of them.
-    """
-
-    var keys: Pointer[UInt8, MutUntrackedOrigin]
-    """The bytes of every key, one after another."""
-    var allocated_bytes: Int
-    """How many bytes `keys` can hold."""
-    var keys_end: Pointer[Scalar[Self.KeyEndType], MutUntrackedOrigin]
-    """Where each key ends in `keys`."""
-    var count: Int
-    """How many keys are stored."""
-    var capacity: Int
-    """How many end offsets `keys_end` can hold."""
-
-    def __init__(out self, capacity: Int):
-        """Constructs a container with room for `capacity` keys.
-
-        Args:
-            capacity: The number of keys to reserve offsets for. The byte
-                buffer starts at eight times that, and grows as needed.
-        """
-        comptime assert (
-            Self.KeyEndType == .uint8
-            or Self.KeyEndType == .uint16
-            or Self.KeyEndType == .uint32
-            or Self.KeyEndType == .uint64
-        ), "KeyEndType needs to be an unsigned integer"
-        # Below this, growth cannot make progress: the offset array grows by
-        # half, which rounds to nothing at one, and the byte buffer grows by
-        # half of zero.
-        var slots = capacity if capacity > _MIN_KEYS else _MIN_KEYS
-        self.allocated_bytes = slots << 3
-        self.keys = alloc[UInt8]({count = self.allocated_bytes}).unsafe_leak()
-        self.keys_end = alloc[Scalar[Self.KeyEndType]](
-            {count = slots}
-        ).unsafe_leak()
-        self.count = 0
-        self.capacity = slots
-
-    def __init__(out self, *, copy: Self):
-        """Constructs an independent copy.
-
-        Args:
-            copy: The container to duplicate.
-        """
-        self.allocated_bytes = copy.allocated_bytes
-        self.count = copy.count
-        self.capacity = copy.capacity
-        self.keys = alloc[UInt8]({count = self.allocated_bytes}).unsafe_leak()
-        unsafe_memcpy(dest=self.keys, src=copy.keys, count=self.allocated_bytes)
-        self.keys_end = alloc[Scalar[Self.KeyEndType]](
-            {count = self.capacity}
-        ).unsafe_leak()
-        unsafe_memcpy(
-            dest=self.keys_end, src=copy.keys_end, count=self.capacity
-        )
-
-    def __deinit__(deinit self):
-        """Releases both buffers."""
-        dealloc(
-            Allocation(
-                unsafe_owned_ptr=self.keys,
-                layout={count = self.allocated_bytes},
-            )
-        )
-        dealloc(
-            Allocation(
-                unsafe_owned_ptr=self.keys_end, layout={count = self.capacity}
-            )
-        )
-
-    @always_inline
-    def add(mut self, key: StringSlice):
-        """Appends a key, growing either buffer if it has to.
-
-        Args:
-            key: The key to store. Its bytes are copied.
-        """
-        var prev_end = (
-            0 if self.count
-            == 0 else self.keys_end[unsafe_offset=self.count - 1]
-        )
-        var key_length = key.byte_length()
-        var new_end = prev_end + Scalar[Self.KeyEndType](key_length)
-
-        var old_allocated_bytes = self.allocated_bytes
-        var needs_realocation = False
-        while new_end > Scalar[Self.KeyEndType](self.allocated_bytes):
-            self.allocated_bytes += self.allocated_bytes >> 1
-            needs_realocation = True
-
-        if needs_realocation:
-            var keys = alloc[UInt8](
-                {count = self.allocated_bytes}
-            ).unsafe_leak()
-            unsafe_memcpy(dest=keys, src=self.keys, count=Int(prev_end))
-            dealloc(
-                Allocation(
-                    unsafe_owned_ptr=self.keys,
-                    layout={count = old_allocated_bytes},
-                )
-            )
-            self.keys = keys
-
-        unsafe_memcpy(
-            dest=self.keys.unsafe_offset(prev_end),
-            src=Pointer(key.unsafe_ptr()),
-            count=key_length,
-        )
-        var count = self.count + 1
-        if count >= self.capacity:
-            var new_capacity = self.capacity + (self.capacity >> 1)
-            if new_capacity <= count:
-                new_capacity = count + 1
-            var keys_end = alloc[Scalar[Self.KeyEndType]](
-                {count = new_capacity}
-            ).unsafe_leak()
-            unsafe_memcpy(dest=keys_end, src=self.keys_end, count=self.capacity)
-            dealloc(
-                Allocation(
-                    unsafe_owned_ptr=self.keys_end,
-                    layout={count = self.capacity},
-                )
-            )
-            self.keys_end = keys_end
-            self.capacity = new_capacity
-
-        self.keys_end.unsafe_store(self.count, new_end)
-        self.count = count
-
-    @always_inline
-    def get(self, index: Int) -> StringSlice[ImmOrigin(origin_of(self))]:
-        """Returns the key at `index`, or an empty slice if out of range.
-
-        Args:
-            index: The key index.
-
-        Returns:
-            A slice borrowing the container's byte buffer.
-        """
-        var keys_ptr = self.keys.as_imm().unsafe_origin_cast[origin_of(self)]()
-        if index < 0 or index >= self.count:
-            return StringSlice(
-                unsafe_from_utf8=Span(unsafe_ptr=keys_ptr, length=0)
-            )
-        var start = 0 if index == 0 else Int(
-            self.keys_end[unsafe_offset=index - 1]
-        )
-        var length = Int(self.keys_end[unsafe_offset=index]) - start
-        return StringSlice(
-            unsafe_from_utf8=Span(
-                unsafe_ptr=keys_ptr.unsafe_offset(start), length=length
-            )
-        )
-
-    @always_inline
-    def clear(mut self):
-        """Forgets every key, keeping the allocated buffers."""
-        self.count = 0
-
-    @always_inline
-    def __getitem__(
-        self, index: Int
-    ) -> StringSlice[ImmOrigin(origin_of(self))]:
-        """Returns the key at `index`.
-
-        Args:
-            index: The key index.
-
-        Returns:
-            A slice borrowing the container's byte buffer.
-        """
-        return self.get(index)
-
-    @always_inline
-    def __len__(self) -> Int:
-        """Returns how many keys are stored.
-
-        Returns:
-            The key count.
-        """
-        return self.count
-
-    def keys_vec(self, out result: List[StringSlice[origin_of(self)]]):
-        """Returns every key as a list of slices.
-
-        Args:
-            result: The list to build, named for the return type.
-        """
-        var keys = type_of(result)(capacity=self.count)
-        for i in range(self.count):
-            keys.append(self[i])
-        return keys^
-
-    def print_keys(self):
-        """Prints every key, for debugging."""
-        print("(" + String(self.count) + ")[", end="")
-        for i in range(self.count):
-            var end = ", " if i < self.count - 1 else ""
-            print(self[i], end=end)
-        print("]")
+"""The smallest number of entries a map will allocate room for."""
 
 
 struct StringDict[
@@ -375,18 +173,29 @@ struct StringDict[
             container is for; turn it on for insert-heavy maps that grow.
     """
 
-    var _keys: KeysContainer[Self.KeyOffsetType]
-    """The keys, packed end to end. Reachable through `key_storage()`."""
+    var _key_buffer: Pointer[UInt8, MutUntrackedOrigin]
+    """Every key's bytes, one after another with no separator and no per-key
+    header. This is the one buffer that does not grow with the entry count: it
+    grows when the bytes run out, which depends on how long the keys are."""
+    var allocated_bytes: Int
+    """How many bytes `_key_buffer` can hold."""
+    var entry_count: Int
+    """Entries ever added, deleted ones included. They are never renumbered."""
+    var keys_end: Pointer[Scalar[Self.KeyOffsetType], MutUntrackedOrigin]
+    """Where each key ends in `_key_buffer`; key `i` runs from `keys_end[i-1]`
+    to `keys_end[i]`. One offset per key instead of a `String` header and an
+    allocation each."""
     var control: Pointer[UInt8, MutUntrackedOrigin]
     """One byte per slot: `_EMPTY`, `_DELETED`, or the top seven bits of the
     key's hash. `GROUP` of them are compared at once, and the first `GROUP`
     bytes are mirrored past the end so a load near the end stays in bounds."""
     var entries: Pointer[UInt8, MutUntrackedOrigin]
     """One allocation holding every entry-indexed region: the cached hashes,
-    the values, and the tombstone mask. They are indexed by entry rather than
-    by slot, and so grow together, on a schedule of their own -- reusing a
-    deleted slot still appends an entry, so under churn entries outnumber
-    slots."""
+    the key end offsets, the values, and the tombstone mask. All four are
+    indexed by entry and there is exactly one entry per key, so they share a
+    capacity and grow in one step. Entries are indexed separately from slots --
+    reusing a deleted slot still appends an entry, so under churn entries
+    outnumber slots."""
     var entry_capacity: Int
     """Entries the block has room for, shared by all three regions."""
     var entry_hashes: Pointer[UInt64, MutUntrackedOrigin]
@@ -430,8 +239,6 @@ struct StringDict[
             self.capacity = capacity if pop_count(icapacity) == 1 else 1 << Int(
                 bit_width(icapacity)
             )
-        self._keys = KeysContainer[Self.KeyOffsetType](self.capacity)
-
         self.slot_to_index = alloc[Scalar[Self.KeyCountType]](
             {count = _slot_block_count[Self.KeyCountType](self.capacity)}
         ).unsafe_leak()
@@ -440,12 +247,25 @@ struct StringDict[
         ).unsafe_bitcast[UInt8]()
         unsafe_memset_zero(self.slot_to_index, self.capacity)
         unsafe_memset(self.control, _EMPTY, self.capacity + GROUP)
-        self.entry_capacity = self._keys.capacity
+        self.entry_count = 0
+        self.entry_capacity = (
+            self.capacity if self.capacity > _MIN_KEYS else _MIN_KEYS
+        )
         self.entries = Self._alloc_entries(self.entry_capacity)
-        # Placeholders; `_bind_entries` sets all three from `entries`.
+        # Placeholders; `_bind_entries` sets all four from `entries`.
         self.entry_hashes = self.entries.unsafe_bitcast[UInt64]()
+        self.keys_end = self.entries.unsafe_bitcast[
+            Scalar[Self.KeyOffsetType]
+        ]()
         self._values = self.entries.unsafe_bitcast[Self.V]()
         self.deleted_mask = self.entries
+        # Eight bytes a key is a guess at the average, and the buffer grows
+        # from there; it is the only region whose size the entry count does not
+        # decide.
+        self.allocated_bytes = self.entry_capacity << 3
+        self._key_buffer = alloc[UInt8](
+            {count = self.allocated_bytes}
+        ).unsafe_leak()
         self._bind_entries()
         self._clear_mask(0)
 
@@ -458,7 +278,7 @@ struct StringDict[
         self.count = copy.count
         self.occupied = copy.occupied
         self.capacity = copy.capacity
-        self._keys = copy._keys
+        self.entry_count = copy.entry_count
 
         # One block holds both regions, so one memcpy duplicates them.
         var block = _slot_block_count[Self.KeyCountType](self.capacity)
@@ -474,19 +294,35 @@ struct StringDict[
         self.entry_capacity = copy.entry_capacity
         self.entries = Self._alloc_entries(self.entry_capacity)
         self.entry_hashes = self.entries.unsafe_bitcast[UInt64]()
+        self.keys_end = self.entries.unsafe_bitcast[
+            Scalar[Self.KeyOffsetType]
+        ]()
         self._values = self.entries.unsafe_bitcast[Self.V]()
         self.deleted_mask = self.entries
+        self.allocated_bytes = copy.allocated_bytes
+        self._key_buffer = alloc[UInt8](
+            {count = self.allocated_bytes}
+        ).unsafe_leak()
+        unsafe_memcpy(
+            dest=self._key_buffer,
+            src=copy._key_buffer,
+            count=copy.allocated_bytes,
+        )
         self._bind_entries()
-        # The hashes and the mask are plain bytes, but the values are `V` and
-        # may own memory, so they are copied one by one rather than memcpy'd.
+        unsafe_memcpy(
+            dest=self.keys_end, src=copy.keys_end, count=copy.entry_count
+        )
+        # The offsets, hashes and mask are plain bytes, but the values are `V`
+        # and may own memory, so they are copied one by one rather than
+        # memcpy'd.
         unsafe_uninit_copy_n[overlapping=False](
-            dest=self._values, src=copy._values, count=copy._keys.count
+            dest=self._values, src=copy._values, count=copy.entry_count
         )
         comptime if Self.caching_hashes:
             unsafe_memcpy(
                 dest=self.entry_hashes,
                 src=copy.entry_hashes,
-                count=copy._keys.count,
+                count=copy.entry_count,
             )
         comptime if Self.destructive:
             unsafe_memcpy(
@@ -501,7 +337,10 @@ struct StringDict[
         Args:
             move: The map to move from.
         """
-        self._keys = move._keys^
+        self._key_buffer = move._key_buffer
+        self.allocated_bytes = move.allocated_bytes
+        self.entry_count = move.entry_count
+        self.keys_end = move.keys_end
         self.control = move.control
         self.entries = move.entries
         self.entry_capacity = move.entry_capacity
@@ -533,10 +372,10 @@ struct StringDict[
             "StringDict values must not need more than 8-byte alignment; the"
             " entry block is a word array"
         )
-        var block = _entry_block[Self.V, Self.caching_hashes, Self.destructive](
-            capacity
-        )
-        return (block[2] + 7) >> 3
+        var block = _entry_block[
+            Self.V, Self.KeyOffsetType, Self.caching_hashes, Self.destructive
+        ](capacity)
+        return (block[3] + 7) >> 3
 
     @staticmethod
     @always_inline
@@ -557,7 +396,7 @@ struct StringDict[
 
     @always_inline
     def _bind_entries(mut self):
-        """Points the three region fields into `entries`.
+        """Points the four region fields into `entries`.
 
         Called after every allocation of the block. The regions are kept as
         fields rather than recomputed per access, for the same reason the probe
@@ -565,14 +404,92 @@ struct StringDict[
         compiler cannot prove a store through one misses a load through
         another, and would reload the offsets on every use.
         """
-        var block = _entry_block[Self.V, Self.caching_hashes, Self.destructive](
-            self.entry_capacity
-        )
+        var block = _entry_block[
+            Self.V, Self.KeyOffsetType, Self.caching_hashes, Self.destructive
+        ](self.entry_capacity)
         self.entry_hashes = self.entries.unsafe_bitcast[UInt64]()
-        self._values = self.entries.unsafe_offset(block[0]).unsafe_bitcast[
+        self.keys_end = self.entries.unsafe_offset(block[0]).unsafe_bitcast[
+            Scalar[Self.KeyOffsetType]
+        ]()
+        self._values = self.entries.unsafe_offset(block[1]).unsafe_bitcast[
             Self.V
         ]()
-        self.deleted_mask = self.entries.unsafe_offset(block[1])
+        self.deleted_mask = self.entries.unsafe_offset(block[2])
+
+    @always_inline
+    def _append_key(
+        mut self,
+        key: StringSlice,
+        index: Int,
+        ends: Pointer[Scalar[Self.KeyOffsetType], MutUntrackedOrigin],
+    ):
+        """Copies `key` into the packed buffer and records where it ends.
+
+        The caller must have reserved entry `index` already, since the end
+        offset it writes lives in the entry block.
+
+        Args:
+            key: The key to store. Its bytes are copied.
+            index: The entry index this key belongs to.
+            ends: The end-offset region, passed in so the caller's hoisted
+                pointer is used instead of a reload of the field.
+        """
+        var prev_end = 0 if index == 0 else Int(ends[unsafe_offset=index - 1])
+        var length = key.byte_length()
+        var new_end = prev_end + length
+
+        # Grown inline rather than behind a call: the same split measured 2-3%
+        # slower here, the hot path being a handful of instructions around a
+        # `memcpy`. See docs/improvements.md.
+        if new_end > self.allocated_bytes:
+            var old_bytes = self.allocated_bytes
+            while self.allocated_bytes < new_end:
+                self.allocated_bytes += (self.allocated_bytes >> 1) + 1
+            var grown = alloc[UInt8](
+                {count = self.allocated_bytes}
+            ).unsafe_leak()
+            unsafe_memcpy(dest=grown, src=self._key_buffer, count=prev_end)
+            dealloc(
+                Allocation(
+                    unsafe_owned_ptr=self._key_buffer,
+                    layout={count = old_bytes},
+                )
+            )
+            self._key_buffer = grown
+
+        unsafe_memcpy(
+            dest=self._key_buffer.unsafe_offset(prev_end),
+            src=Pointer(key.unsafe_ptr()),
+            count=length,
+        )
+        ends.unsafe_store(index, Scalar[Self.KeyOffsetType](new_end))
+
+    @always_inline
+    def _key_at(self, index: Int) -> StringSlice[ImmOrigin(origin_of(self))]:
+        """Returns the key of entry `index`, or an empty slice if out of range.
+
+        Args:
+            index: The entry index.
+
+        Returns:
+            A slice borrowing the map's key buffer.
+        """
+        var buffer = self._key_buffer.as_imm().unsafe_origin_cast[
+            origin_of(self)
+        ]()
+        if index < 0 or index >= self.entry_count:
+            return StringSlice(
+                unsafe_from_utf8=Span(unsafe_ptr=buffer, length=0)
+            )
+        var start = 0 if index == 0 else Int(
+            self.keys_end[unsafe_offset=index - 1]
+        )
+        var length = Int(self.keys_end[unsafe_offset=index]) - start
+        return StringSlice(
+            unsafe_from_utf8=Span(
+                unsafe_ptr=buffer.unsafe_offset(start), length=length
+            )
+        )
 
     @always_inline
     def _clear_mask(mut self, first: Int):
@@ -603,11 +520,17 @@ struct StringDict[
         # Every entry ever added still owns its value, deleted ones included:
         # entries are never renumbered, so a deleted entry's value lives until
         # the map does.
-        unsafe_destroy_n(self._values, self._keys.count)
+        unsafe_destroy_n(self._values, self.entry_count)
         dealloc(
             Allocation(
                 unsafe_owned_ptr=self.entries.unsafe_bitcast[UInt64](),
                 layout={count = Self._entry_words(self.entry_capacity)},
+            )
+        )
+        dealloc(
+            Allocation(
+                unsafe_owned_ptr=self._key_buffer,
+                layout={count = self.allocated_bytes},
             )
         )
 
@@ -638,11 +561,14 @@ struct StringDict[
             The size of the key buffer, which holds every key's bytes end to
             end -- live and deleted alike.
         """
-        return self._keys.allocated_bytes
+        return self.allocated_bytes
 
     def print_keys(self):
         """Prints every stored key, live or deleted, for debugging."""
-        self._keys.print_keys()
+        print("(", self.entry_count, ")[", sep="", end="")
+        for i in range(self.entry_count):
+            print(self._key_at(i), end=", " if i < self.entry_count - 1 else "")
+        print("]")
 
     def __bool__(self) -> Bool:
         """Returns whether the map holds any live entry.
@@ -747,11 +673,11 @@ struct StringDict[
         Args:
             other: The map to copy entries from.
         """
-        for index in range(other._keys.count):
+        for index in range(other.entry_count):
             comptime if Self.destructive:
                 if other._is_deleted(index):
                     continue
-            self.put(other._keys[index], other._values[unsafe_offset=index])
+            self.put(other._key_at(index), other._values[unsafe_offset=index])
 
     def keys(
         ref self,
@@ -830,7 +756,7 @@ struct StringDict[
     def _next_live(self, index: Int) -> Int:
         """Returns the first live key index at or after `index`, else -1."""
         var current = index
-        while current < self._keys.count:
+        while current < self.entry_count:
             comptime if Self.destructive:
                 if self._is_deleted(current):
                     current += 1
@@ -908,7 +834,7 @@ struct StringDict[
             # Always checked, not `debug_assert`: the failure is a wrong answer
             # rather than a crash, and it is silent at the assertion levels a
             # release build uses.
-            if self._keys.count >= MAX_ENTRIES:
+            if self.entry_count >= MAX_ENTRIES:
                 abort(
                     String(
                         "StringDict: ",
@@ -917,23 +843,30 @@ struct StringDict[
                             " entries is all this KeyCountType can index, and"
                             " this is entry "
                         ),
-                        self._keys.count + 1,
+                        self.entry_count + 1,
                         (
                             ". Widen KeyCountType. Deleted entries count, since"
                             " they are never renumbered."
                         ),
                     )
                 )
-        self._keys.add(key)
-        var index = self._keys.count - 1
+        var index = self.entry_count
         self._reserve_entry(index)
-        self._values.unsafe_offset(index).unsafe_write(value.copy())
+        # Hoisted after the reserve, the only thing that can move them. All
+        # four regions share one allocation, so as far as the compiler knows a
+        # store through any of them could alias a load of the others' fields,
+        # and it would reload each on every use.
+        var ends = self.keys_end
+        var values = self._values
+        self._append_key(key, index, ends)
+        values.unsafe_offset(index).unsafe_write(value.copy())
         comptime if Self.caching_hashes:
             self.entry_hashes.unsafe_store(index, key_hash)
+        self.entry_count += 1
         self.count += 1
         if self.control[unsafe_offset=reusable] == _EMPTY:
             self.occupied += 1
-        self._occupy(reusable, key_hash, self._keys.count)
+        self._occupy(reusable, key_hash, self.entry_count)
 
     @always_inline
     @staticmethod
@@ -969,7 +902,7 @@ struct StringDict[
         comptime if Self.caching_hashes:
             if self.entry_hashes[unsafe_offset=key_index - 1] != key_hash:
                 return False
-        return self._keys[key_index - 1] == key
+        return self._key_at(key_index - 1) == key
 
     @always_inline
     def _occupy(mut self, slot: Int, key_hash: UInt64, key_index: Int):
@@ -1030,17 +963,17 @@ struct StringDict[
         var old_capacity = self.entry_capacity
         var old_entries = self.entries
         var old_values = self._values
+        var old_ends = self.keys_end
         var old_hashes = self.entry_hashes
         var old_mask = self.deleted_mask
 
         var grown = old_capacity
         while grown <= index:
-            grown += grown if grown > 0 else 1
-        # The keys container holds end offsets for this many entries already;
-        # matching it keeps the two from reallocating on separate schedules.
-        if self._keys.capacity > grown:
-            grown = self._keys.capacity
-
+            # By half rather than by doubling: this block carries the values
+            # and the key end offsets, which is most of what an entry costs,
+            # and overshooting by half wastes a third less in a container
+            # chosen for footprint. The `+ 1` keeps the step positive at one.
+            grown += (grown >> 1) + 1
         self.entry_capacity = grown
         self.entries = Self._alloc_entries(grown)
         self._bind_entries()
@@ -1048,13 +981,14 @@ struct StringDict[
         # Values may own memory, so they are moved rather than copied; the
         # hashes and the mask are plain bytes.
         unsafe_uninit_move_n[overlapping=False](
-            dest=self._values, src=old_values, count=self._keys.count
+            dest=self._values, src=old_values, count=self.entry_count
         )
+        unsafe_memcpy(dest=self.keys_end, src=old_ends, count=self.entry_count)
         comptime if Self.caching_hashes:
             unsafe_memcpy(
                 dest=self.entry_hashes,
                 src=old_hashes,
-                count=self._keys.count,
+                count=self.entry_count,
             )
         comptime if Self.destructive:
             var carried = (old_capacity + 7) >> 3
@@ -1134,7 +1068,7 @@ struct StringDict[
             comptime if Self.caching_hashes:
                 key_hash = self.entry_hashes[unsafe_offset=key_index - 1]
             else:
-                key_hash = hash(self._keys[key_index - 1])
+                key_hash = hash(self._key_at(key_index - 1))
             var slot = Int(key_hash & UInt64(mask))
             var control = self.control
             while True:
@@ -1216,8 +1150,8 @@ struct StringDict[
 
     def clear(mut self):
         """Removes every entry, keeping the allocated storage."""
-        unsafe_destroy_n(self._values, self._keys.count)
-        self._keys.clear()
+        unsafe_destroy_n(self._values, self.entry_count)
+        self.entry_count = 0
         unsafe_memset_zero(self.slot_to_index, self.capacity)
         unsafe_memset(self.control, _EMPTY, self.capacity + GROUP)
         self.occupied = 0
@@ -1387,7 +1321,7 @@ struct _KeysIter[
         self._index = self._src[]._next_live(index + 1)
         # The container hands back a slice carrying an origin interior to the
         # map; rebuild it against the whole-map origin the iterator promises.
-        var borrowed = self._src[]._keys[index]
+        var borrowed = self._src[]._key_at(index)
         return StringSlice[ImmOrigin(Self.origin)](
             unsafe_from_utf8=Span[Byte, ImmOrigin(Self.origin)](
                 unsafe_ptr=borrowed.unsafe_ptr().unsafe_origin_cast[
@@ -1574,7 +1508,7 @@ struct _ItemsIter[
             raise StopIteration()
         var index = self._index
         self._index = self._src[]._next_live(index + 1)
-        var borrowed = self._src[]._keys[index]
+        var borrowed = self._src[]._key_at(index)
         var key = StringSlice[ImmOrigin(Self.origin)](
             unsafe_from_utf8=Span[Byte, ImmOrigin(Self.origin)](
                 unsafe_ptr=borrowed.unsafe_ptr().unsafe_origin_cast[

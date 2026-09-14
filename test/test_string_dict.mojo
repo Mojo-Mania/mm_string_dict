@@ -1,5 +1,5 @@
 from corpora import load, names
-from mm_string_dict import GROUP, KeysContainer, StringDict
+from mm_string_dict import GROUP, StringDict
 from std.testing import (
     TestSuite,
     assert_equal,
@@ -10,58 +10,68 @@ from std.testing import (
 
 
 # ===-----------------------------------------------------------------------===#
-# KeysContainer
+# The packed key store
+#
+# Keys live end to end in one byte buffer, addressed by a parallel array of end
+# offsets that shares the entry block with the values. These tests exercise
+# that store through the map, which is the only way in now that it is not a
+# separate type.
 # ===-----------------------------------------------------------------------===#
 
 
-def test_keys_container_stores_and_returns() raises:
-    var keys = KeysContainer[DType.uint32](8)
-    keys.add("alpha")
-    keys.add("beta")
-    keys.add("")
-    keys.add("gamma")
-    assert_equal(len(keys), 4)
-    assert_equal(String(keys[0]), "alpha")
-    assert_equal(String(keys[1]), "beta")
-    assert_equal(String(keys[2]), "")
-    assert_equal(String(keys[3]), "gamma")
+def test_keys_round_trip_including_the_empty_one() raises:
+    """An empty key stores no bytes, so it is the case offsets get wrong."""
+    var dict = StringDict[Int]()
+    dict["alpha"] = 0
+    dict["beta"] = 1
+    dict[""] = 2
+    dict["gamma"] = 3
+
+    assert_equal(len(dict), 4)
+    assert_equal(dict.get("alpha", -1), 0)
+    assert_equal(dict.get("beta", -1), 1)
+    assert_equal(dict.get("", -1), 2)
+    assert_equal(dict.get("gamma", -1), 3)
+    assert_true("" in dict)
 
 
-def test_keys_container_out_of_range_is_empty() raises:
-    var keys = KeysContainer[DType.uint32](8)
-    keys.add("only")
-    assert_equal(String(keys[-1]), "")
-    assert_equal(String(keys[1]), "")
+def test_key_buffer_grows_for_long_keys() raises:
+    """The byte buffer grows on bytes, not on entry count.
 
-
-def test_keys_container_grows_its_byte_buffer() raises:
-    var keys = KeysContainer[DType.uint32](4)
+    Twenty keys fit any starting capacity; five hundred bytes each do not, so
+    this drives the one buffer whose size the entry count does not decide.
+    """
+    var dict = StringDict[Int]()
     var long = String("x") * 500
     for i in range(20):
-        keys.add(String(long, i))
-    assert_equal(len(keys), 20)
+        dict[String(long, i)] = i
+    assert_equal(len(dict), 20)
     for i in range(20):
-        assert_equal(String(keys[i]), String(long, i))
+        assert_equal(dict.get(String(long, i), -1), i)
 
 
-def test_keys_container_clear_and_reuse() raises:
-    var keys = KeysContainer[DType.uint32](8)
-    keys.add("alpha")
-    keys.clear()
-    assert_equal(len(keys), 0)
-    keys.add("beta")
-    assert_equal(len(keys), 1)
-    assert_equal(String(keys[0]), "beta")
+def test_keys_survive_clear_and_reuse() raises:
+    var dict = StringDict[Int]()
+    dict["alpha"] = 1
+    dict.clear()
+    assert_equal(len(dict), 0)
+    assert_false("alpha" in dict)
+    dict["beta"] = 2
+    assert_equal(len(dict), 1)
+    assert_equal(dict.get("beta", -1), 2)
 
 
-def test_keys_container_copy_is_independent() raises:
-    var keys = KeysContainer[DType.uint32](8)
-    keys.add("alpha")
-    var duplicate = keys.copy()
-    keys.add("beta")
+def test_key_buffer_copy_is_independent() raises:
+    """A copy must duplicate the byte buffer, not share it."""
+    var dict = StringDict[Int]()
+    dict["alpha"] = 1
+    var duplicate = dict.copy()
+    dict["beta"] = 2
+
     assert_equal(len(duplicate), 1)
-    assert_equal(len(keys), 2)
-    assert_equal(String(duplicate[0]), "alpha")
+    assert_equal(len(dict), 2)
+    assert_equal(duplicate.get("alpha", -1), 1)
+    assert_false("beta" in duplicate)
 
 
 # ===-----------------------------------------------------------------------===#

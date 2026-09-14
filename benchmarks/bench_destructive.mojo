@@ -53,8 +53,7 @@ def footprint(map: Map) -> Int:
     """Every byte the map has allocated, mask included."""
     comptime INDEX = size_of[Scalar[Map.KeyCountType]]()
     comptime OFFSET = size_of[Scalar[Map.KeyOffsetType]]()
-    var total = map._keys.allocated_bytes  # packed key bytes
-    total += map._keys.capacity * OFFSET  # end offsets
+    var total = map.allocated_bytes  # packed key bytes
     total += map.capacity + GROUP  # control bytes plus mirror
     total += map.capacity * INDEX  # slot -> entry index
     # Values, cached hashes and the tombstone mask share one entry block.
