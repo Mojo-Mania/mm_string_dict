@@ -36,6 +36,38 @@ for entry in counts.items():
 The surface mirrors the stdlib `Dict` where it can, so swapping one for the
 other is mostly mechanical.
 
+## When to use it
+
+**It halves the memory.** Across twelve real word lists a `StringDict` takes
+**52% of what `Dict[String, Int]` takes** — 20–31 bytes of overhead per entry
+against 48–90. A stdlib slot is 40 bytes before any key data (an 8-byte hash, a
+24-byte `String`, an 8-byte value), and a key longer than 23 bytes gets a heap
+allocation of its own on top. Here a key costs its bytes, four bytes of end
+offset, and nothing else.
+
+**Reach for it when:**
+
+- You hold a lot of string keys and the footprint matters — a symbol table, an
+  inverted index, a vocabulary, a lookup table read far more often than written.
+- You build many small maps: one per document, per request, per group. That is
+  where it wins outright, **519 ns per 20-word document against the stdlib's
+  813**, and it wins at every size measured.
+- Your workload is read-mostly, or counts things. Lookups are level with the
+  stdlib and `upsert` beats it on ten of twelve corpora, english by 68%.
+- You know the size up front. `StringDict[Int](capacity=n)` removes the growth
+  that is the whole of the remaining insert gap.
+
+**Look elsewhere when:**
+
+- Your keys are not strings. This is string-keyed only, by construction.
+- Your keys are huge. At 400–560 bytes per key the memory advantage disappears
+  (98–135% of `Dict`) and present-key lookups run 1.5–2× slower.
+- You churn heavily. A deleted entry's key bytes and value are held until the
+  map is dropped, because entries are never renumbered, so a long-lived map
+  under constant insert/delete grows in key storage even as the table does not.
+- You insert into one big map and do little else. Building is still ~1.3× the
+  stdlib's, all of it in table growth.
+
 ## Install
 
 ```bash
@@ -100,15 +132,15 @@ StringDict[Int, DType.uint32, DType.uint32, True, True]   # cache full hashes to
 
 ## Performance
 
-Apple M-series, release build (`-D ASSERT=none`, which is what `pixi run bench`
-passes), measured against the stdlib `Dict[String, Int]`.
+Apple M-series, release build (`-D ASSERT=none`, which is what the `bench` tasks
+pass), against the stdlib `Dict[String, Int]`.
 
 The keys are real words. `corpora/` holds twelve word lists — Latin, Greek,
 Hebrew, Arabic, Georgian, Devanagari and CJK scripts, plus a list of AWS S3
 action names for long ASCII identifiers — taken from
-[compact-dict](https://github.com/mzaks/compact-dict). Real keys repeat, vary
-in length, and run to several bytes per character, and none of that shows up in
-a benchmark built from fixed-length random strings.
+[compact-dict](https://github.com/mzaks/compact-dict). Real keys repeat, vary in
+length, and run to several bytes per character, and none of that shows up in a
+benchmark built from fixed-length random strings.
 
 | corpus | words | distinct | avg bytes | range |
 | --- | --- | --- | --- | --- |
@@ -125,154 +157,155 @@ a benchmark built from fixed-length random strings.
 | chinese | 10 | 10 | 464 | 441–480 |
 | japanese | 10 | 10 | 499 | 378–558 |
 
+### Memory
+
+The headline. Bytes for a map holding every distinct word of a corpus, counting
+every allocation each container makes.
+
+| corpus | keys | bytes of keys | StringDict | stdlib Dict | ratio | overhead/entry |
+| --- | --- | --- | --- | --- | --- | --- |
+| english | 192 | 1034 | **5203** | 11536 | 45% | 21 vs 54 |
+| german | 208 | 1359 | **6427** | 11536 | 55% | 24 vs 48 |
+| l33t | 339 | 1685 | **10277** | 23056 | 44% | 25 vs 63 |
+| french | 418 | 2809 | **11384** | 23056 | 49% | 20 vs 48 |
+| greek | 320 | 3641 | **13045** | 23211 | 56% | 29 vs 61 |
+| arabic | 336 | 3338 | **13045** | 23082 | 56% | 28 vs 58 |
+| hebrew | 231 | 2334 | **9552** | 23153 | 41% | 31 vs 90 |
+| hindi | 250 | 4555 | **11213** | 24386 | 45% | 26 vs 79 |
+| georgian | 250 | 4558 | **11213** | 25364 | 44% | 26 vs 83 |
+| s3_actions | 143 | 3233 | **7048** | 13353 | 52% | 26 vs 70 |
+| chinese | 10 | 4647 | **5277** | 5383 | 98% | 63 vs 73 |
+| japanese | 10 | 4992 | 7768 | **5728** | 135% | 277 vs 73 |
+| **all twelve** | | | **111452** | 212844 | **52%** | |
+
+`size_of[String]` is 24 bytes, so a stdlib slot is 40 before any key data, and
+Mojo's inline string buffer runs out at 23 bytes — past that each key is a
+separate allocation. A `StringDict` entry costs its key bytes plus four bytes of
+end offset, eight of value, one bit of tombstone, and five bytes in the slot
+table.
+
+The two CJK rows are where this stops paying: at ~500 bytes per key the stdlib's
+per-entry overhead is noise, and with only ten keys the growth overshoot in the
+key buffer is not amortized. A map of a hundred such keys would land back near
+parity.
+
+A map makes three allocations, split by what makes each one grow — the key bytes
+when the bytes run out, the entry block (end offsets, hashes, values, tombstones)
+when the entry count does, and the slot table at 7/8 load.
+
 ### Lookups
 
-Nanoseconds per lookup, lower is better.
+Nanoseconds per lookup.
 
-| corpus | look up every word | | membership, probe from another script | |
+| corpus | every word, present | | probe from another script | |
 | --- | --- | --- | --- | --- |
 | | StringDict | stdlib | StringDict | stdlib |
-| english | 6.6 | **6.5** | **2.5** | 2.8 |
-| german | 7.8 | **7.5** | **2.9** | 3.0 |
-| l33t | 7.9 | **7.2** | **2.2** | 2.5 |
-| french | 8.4 | 8.4 | **2.6** | 2.9 |
-| greek | 9.0 | **8.7** | **2.3** | 2.7 |
-| arabic | **9.3** | 9.7 | **2.3** | 2.6 |
-| hebrew | **9.5** | 9.6 | **2.2** | 2.5 |
-| hindi | **8.8** | 9.1 | **2.2** | 2.5 |
-| georgian | 8.4 | 8.4 | **2.2** | 2.5 |
-| s3_actions | 6.7 | 6.7 | **2.2** | 2.5 |
-| chinese | 40.4 | **24.4** | **2.3** | 2.5 |
-| japanese | 51.2 | **27.5** | **2.3** | 2.5 |
+| english | 7.3 | **7.1** | **2.6** | 2.8 |
+| german | **7.6** | 8.3 | **3.0** | 3.2 |
+| l33t | 7.5 | **7.2** | **2.3** | 2.5 |
+| french | 8.7 | **8.6** | **2.7** | 2.9 |
+| greek | 8.8 | 8.8 | **2.4** | 2.7 |
+| arabic | **9.5** | 9.9 | **2.4** | 2.6 |
+| hebrew | 9.6 | 9.6 | **2.3** | 2.5 |
+| hindi | 9.3 | **9.1** | **2.3** | 2.6 |
+| georgian | 8.5 | **8.3** | **2.3** | 2.5 |
+| s3_actions | 6.9 | **6.7** | **2.3** | 2.5 |
+| chinese | 39.2 | **25.1** | **2.3** | 2.6 |
+| japanese | 56.7 | **27.3** | **2.3** | 2.5 |
 
-Present-key lookups are level with the stdlib `Dict` across every corpus with
-keys of an ordinary size, and misses are consistently a little faster — the
-7-bit tag in the control byte rejects a wrong key without touching the key
-bytes at all.
+Present-key lookups are level on every corpus of ordinary words, and misses are
+consistently a little faster — the 7-bit tag in the control byte rejects a wrong
+key without touching the key bytes at all.
 
-The two CJK corpora are the exception, and the gap there grows with key length:
-their "words" are whole paragraphs of 400–560 bytes, and a hit has to compare
-all of them. That is a real gap, not measurement noise, and it is unexplained —
-both sides bottom out in the same stdlib byte comparison. See
+The CJK corpora are the exception, and the gap grows with key length. That is a
+real gap, not noise, and it is unexplained: both sides hash with the same builtin
+and bottom out in the same stdlib byte comparison. See
 [`docs/improvements.md`](docs/improvements.md).
 
-A miss with the table at 85% load is the case that used to fall apart: before
-the control byte, it walked 24 slots on average and up to 468, because deleting
-never freed a slot and linear probing clustered. The corpora are far too small
-to reach that load, so the benchmark keeps one synthetic case for it — 28000
-keys in 32768 slots, where a miss costs **3.8 ns** against the stdlib's 3.4 ns.
+A miss with the table 85% full — the case that used to fall apart, walking 24
+slots on average before the control byte existed — costs **3.8 ns** against the
+stdlib's 3.4. The corpora are far too small to reach that load, so the benchmark
+keeps one synthetic case for it.
 
 ### Building
 
-Microseconds to index a whole corpus, lower is better. Reported per corpus
-rather than per word: two of these hold ten keys, and dividing a constructor
-across ten inserts measures the constructor, not the insert.
+Microseconds for a whole corpus. Reported per corpus rather than per word: two
+of these hold ten keys, and dividing a constructor across ten inserts measures
+the constructor.
 
-| corpus | build a map | | count word frequencies | |
+| corpus | index every word | | count word frequencies | |
 | --- | --- | --- | --- | --- |
 | | StringDict | stdlib | StringDict | stdlib |
-| english | 14.5 | **9.9** | **11.0** | 18.5 |
-| german | 14.4 | **10.9** | **11.9** | 19.7 |
-| l33t | 10.3 | **7.4** | **9.3** | 11.0 |
-| french | 10.4 | **7.4** | **10.4** | 11.2 |
-| greek | 10.5 | **7.5** | **10.1** | 11.1 |
-| arabic | 10.5 | **7.5** | **10.1** | 11.1 |
-| hebrew | 9.1 | **7.1** | **8.6** | 10.4 |
-| hindi | 10.6 | **7.8** | **10.0** | 12.1 |
-| georgian | 9.9 | **7.3** | **9.5** | 10.6 |
-| s3_actions | 5.4 | **3.8** | 5.6 | **5.3** |
-| chinese | 1.1 | **0.4** | 1.3 | **0.7** |
-| japanese | 1.2 | **0.5** | 1.5 | **0.8** |
+| english | 12.9 | **10.0** | **10.6** | 17.8 |
+| german | 13.4 | **11.0** | **11.3** | 19.6 |
+| l33t | 9.4 | **7.9** | **8.4** | 11.1 |
+| french | 9.6 | **7.4** | **9.3** | 11.3 |
+| greek | 9.6 | **7.6** | **9.2** | 11.2 |
+| arabic | 9.3 | **7.8** | **9.2** | 11.3 |
+| hebrew | 8.1 | **7.2** | **7.9** | 10.6 |
+| hindi | 9.4 | **8.1** | **8.9** | 12.2 |
+| georgian | 8.9 | **7.5** | **8.5** | 10.6 |
+| s3_actions | 4.7 | **3.9** | 4.7 | **5.3** |
 
-Inserting is about 1.4× slower than the stdlib `Dict`, and that is the standing
-weakness — but not where it looks. Taking an insert apart
-(`pixi run bench-anatomy`), a steady-state `put` is already even at 10.8 ns
-against 11.8, and inserting into a pre-sized map is within 4%. The whole gap is
-table growth, which costs 12.3 ns per insert here against the stdlib's 9.0, and
-much of that difference is `_rehash` recomputing a hash for every entry it moves
-where the stdlib reuses a stored one.
+Indexing is about 1.3× the stdlib. Counting — the same work plus a read per word
+— is *faster* on ten of twelve corpora, because `upsert` settles a word in one
+probe where a `Dict` needs a read and then a write. On english that is 68%.
 
-Small maps are a different story, and a good one. One map per document — the
-shape of a term-frequency or grouping pass — runs **519 ns per 20-word document
-against the stdlib's 834**, and beats it at every size measured: 169 ns against
-204 at five words, 1961 against 2823 at a hundred. A map costs three
-allocations, split by what makes each one grow: the key bytes when the bytes run
-out, the entry block when the entry count does, the slot table at 7/8 load.
+### Many small maps
 
-Two switches address the growth cost. If you know the size up front,
-`StringDict[Int](capacity=n)` removes the growth entirely. Otherwise
-`caching_hashes` stores each key's full hash by entry so a rehash reuses it,
-taking growth to 10.9 ns and halving the gap — at 8 bytes per entry, which is
-19–34% of a whole map on these corpora. It is off by default for that reason,
-and it does not change lookups.
+One map per document, which is the shape of a term-frequency or grouping pass.
+Nanoseconds per document.
 
-Word counting is where that reverses, and it now does so on ten of the twelve
-corpora. `upsert` settles a word in one probe against a `Dict`'s read-then-write
-pair, which is worth 40% on english and german — 999 words collapsing to about
-200 distinct ones, so almost every word is an update — and 5–20% elsewhere.
-Only the two CJK corpora and s3_actions, where nearly every word is distinct and
-the insert cost decides, come out behind.
-
-### Deletion support is close to free
-
-`destructive` is on by default; turning it off removes `delete`, `pop` and
-`clear`, and with them one bit per entry. Measured one variant per process
-(`pixi run bench-destructive` and `pixi run bench-non-destructive`), at 28000
-twelve-byte keys:
-
-| | destructive=True | destructive=False |
+| document | StringDict | stdlib |
 | --- | --- | --- |
-| insert | 19.8 ns | 20.2 ns |
-| lookup, hit | 17.4 ns | 17.8 ns |
-| lookup, miss | 3.7 ns | 3.8 ns |
-| footprint | 995909 bytes | 991813 bytes |
+| 5 words | **176** | 205 |
+| 20 words | **526** | 841 |
+| 100 words | **2017** | 2865 |
 
-Reads are unaffected by design: a tombstoned slot is excluded from a lookup by
-its control byte, which no longer matches any 7-bit tag, so probing never
-consults the mask. The mask exists for iteration, which walks entries rather
-than slots.
+### Where an insert's time goes
 
-Inserts used to pay 19% for deletion support. That was not the bit — it was the
-mask's bounds check sitting behind a `@no_inline` call, so every insert paid for
-a call to learn the mask was already big enough. With the check hoisted into the
-caller, the two variants are level and the only remaining cost is the 4096 bytes
-of mask, 0.4% of the map.
+`pixi run bench-anatomy` splits an insert into a fixed cost per map, a
+steady-state cost, and a share of the growth it eventually triggers.
 
-### Memory
+| | StringDict | stdlib |
+| --- | --- | --- |
+| construct + destruct, empty | 38.5 ns | 0.3 ns |
+| put, steady state | **10.5 ns** | 12.2 ns |
+| insert, 4000 keys, pre-sized | 11.4 ns | 11.2 ns |
+| insert, 4000 keys, growing from empty | 22.9 ns | 20.0 ns |
+| → so growth costs | 11.6 ns | 8.7 ns |
 
-This is the reason to reach for the library. Keys are stored end to end in one
-buffer with a parallel array of end offsets: no per-key header, no allocation
-per key, and a repeated word stored once.
+Steady state is ahead, and pre-sized the two are level. The whole of the gap is
+table growth, which is more than half of an insert for both. The stdlib `Dict`
+constructs for nothing because it allocates lazily; that suits a type used for
+empty dictionaries everywhere, which this one is not.
 
-| corpus | distinct keys | bytes of keys | key buffer |
-| --- | --- | --- | --- |
-| english | 192 | 1034 | 1458 |
-| german | 208 | 1359 | 1458 |
-| s3_actions | 143 | 3233 | 3280 |
-| hindi | 250 | 4555 | 4920 |
-| japanese | 10 | 4992 | 7380 |
+### Tuning
 
-The buffer runs 1.0–1.5× the bytes the keys need, and the excess is unused tail
-from the last growth step, not per-key overhead. A `Dict[String, Int]` instead
-stores a `String` per entry: 24 bytes of header each before any of its bytes,
-and a separate allocation once a key outgrows the inline buffer. The slot table
-costs 5 bytes per slot (1 control byte + 4 index), down from 8 before the
-control byte replaced the cached hash.
+| parameter | default | what it buys |
+| --- | --- | --- |
+| `capacity=n` | 16 | Removes growth, which is the entire insert gap. |
+| `destructive` | `True` | `delete`/`pop`/`clear`, for one bit per entry and no measurable time. |
+| `caching_hashes` | `False` | A rehash reuses stored hashes instead of recomputing: growth 12.3 → 10.9 ns, 4–7% off a build. Costs 8 bytes per entry, 19–34% of a map. Does not change lookups. |
+| `KeyCountType` | `uint32` | Narrower shrinks the slot table; `put` aborts if entries exceed what it can index. |
+| `KeyOffsetType` | `uint32` | Caps the total size of all keys together. |
 
 ## Development
 
 ```bash
-pixi run test     # the test suite (55 tests)
-pixi run bench    # the benchmarks above
-pixi run bench-destructive      # the destructive=True variant, alone
-pixi run bench-non-destructive  # the destructive=False variant, alone
-pixi run bench-anatomy          # where an insert's time actually goes
+pixi run test                   # the test suite (54 tests)
+pixi run main                   # the example
+pixi run format                 # mojo format
+pixi run docs                   # docstring check
+pixi build                      # the conda package (needs pixi >= 0.80)
+
+pixi run bench                  # the corpus tables above
+pixi run bench-small-maps       # one map per document
+pixi run bench-anatomy          # where an insert's time goes
+pixi run bench-destructive      # destructive=True, one variant per process
+pixi run bench-non-destructive  # destructive=False, likewise
 pixi run bench-cached           # the corpus tables with caching_hashes on
 pixi run bench-anatomy-cached   # the anatomy with caching_hashes on
-pixi run main     # the example
-pixi run format   # mojo format
-pixi run docs     # docstring check
-pixi build        # build the conda package (needs pixi >= 0.80)
 ```
 
 ## Provenance
