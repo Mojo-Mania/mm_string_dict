@@ -44,10 +44,26 @@ falls back to hashing only for the single doubling past 65536 slots -- a branch
 reachable between 57344 and 65535 entries, and tested there.
 
 `StringDict[V, .uint16]` is therefore 12% smaller than the default across the
-corpora, 4-7 bytes an entry, for no measurable change in build time and about 3%
-on lookups. At **51% of a `Dict`** it beats turning the cache off while keeping
-the build speed the cache buys, and it is the right default for any dictionary
-that will not reach 65535 keys.
+corpora, 4-7 bytes an entry, at **no measurable cost in time**. At 51% of a
+`Dict` it beats turning the cache off while keeping the build speed the cache
+buys, and it is the right configuration for any dictionary that will not reach
+65535 keys.
+
+### A note on measuring this one
+
+The first comparison ran both index widths in one process and reported lookups
+3% slower on `uint16`, which was then written up as the cost of widening a
+16-bit index on every probe. That explanation was invented, and the number was
+noise: a second run of the same benchmark had `uint16` faster on every row. A
+third, comparing builds, showed `uint16` 10-28% *faster* -- also noise, from a
+cold first invocation.
+
+Measured one width per process and repeated, both build and lookup are level.
+There is no widening cost to explain: a 16-bit load zero-extends in the same
+instruction as a 32-bit one. This is the third time in this container's history
+that an in-process comparison has produced a confident wrong answer, after the
+cached-hash ordering and the `destructive` build figures. Anything allocator- or
+cache-sensitive gets one variant per process here.
 
 The first version of this stored the full 64-bit hash and was worth only 1.4 ns
 per insert, against a predicted 2.4. Narrowing it to 32 bits and taking the tag

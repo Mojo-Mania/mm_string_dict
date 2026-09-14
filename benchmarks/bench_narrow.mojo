@@ -7,16 +7,23 @@ slot index drops from 4 bytes to 2, and with it the cached hash, which is sized
 from the same parameter because a rehash only needs as many hash bits as the
 capacity has.
 
-Run with `pixi run bench-narrow`.
+Timings are one index width per process (`pixi run bench-narrow` and
+`bench-narrow-16`), because measuring both in one gave contradictory orderings
+run to run. The footprint table is exact and needs no such care.
 """
 
 from corpora import load, names
 from mm_string_dict import GROUP, StringDict
 from std.benchmark import Unit, keep, run
+from std.sys import get_defined_bool
 from std.sys.info import size_of
 
 comptime Wide = StringDict[Int, .uint32]
 comptime Narrow = StringDict[Int, .uint16]
+
+comptime NARROW = get_defined_bool["NARROW", False]()
+comptime INDEX = DType.uint16 if NARROW else DType.uint32
+comptime Timed = StringDict[Int, INDEX]
 
 
 def measure(f: Some[ImplicitlyCopyable & (def() raises)]) raises -> Float64:
@@ -65,19 +72,13 @@ def narrow_bytes(map: Narrow) -> Int:
 def bench_build() raises:
     print("")
     print("index a whole corpus (microseconds)")
-    print("   corpus        uint32   uint16   stdlib")
-    print("   ----------------------------------------")
+    print("   corpus       StringDict   stdlib")
+    print("   ----------------------------------")
     for name in names():
         var words = load(name)
 
-        def wide() raises {imm words}:
-            var map = Wide()
-            for i in range(len(words)):
-                map.put(words[i], i)
-            keep(len(map))
-
-        def narrow() raises {imm words}:
-            var map = Narrow()
+        def ours() raises {imm words}:
+            var map = Timed()
             for i in range(len(words)):
                 map.put(words[i], i)
             keep(len(map))
@@ -91,8 +92,7 @@ def bench_build() raises:
         print(
             "  ",
             pad(name, 12),
-            rpad(fmt(measure(wide) / 1000.0), 6),
-            rpad(fmt(measure(narrow) / 1000.0), 8),
+            rpad(fmt(measure(ours) / 1000.0), 8),
             rpad(fmt(measure(theirs) / 1000.0), 8),
         )
 
@@ -100,17 +100,15 @@ def bench_build() raises:
 def bench_lookup() raises:
     print("")
     print("look up every word (ns per lookup)")
-    print("   corpus        uint32   uint16   stdlib")
-    print("   ----------------------------------------")
+    print("   corpus       StringDict   stdlib")
+    print("   ----------------------------------")
     for name in names():
         var words = load(name)
         var count = Float64(len(words))
-        var wide_map = Wide()
-        var narrow_map = Narrow()
+        var map = Timed()
         var theirs_map = Dict[String, Int]()
         for i in range(len(words)):
-            wide_map.put(words[i], i)
-            narrow_map.put(words[i], i)
+            map.put(words[i], i)
             theirs_map[words[i]] = i
 
         # Independently allocated probes; see bench_string_dict.mojo for why.
@@ -118,16 +116,10 @@ def bench_lookup() raises:
         for i in range(len(words)):
             probes.append(String(words[i], ""))
 
-        def wide() raises {imm wide_map, imm probes}:
+        def ours() raises {imm map, imm probes}:
             var total = 0
             for i in range(len(probes)):
-                total += wide_map.get(probes[i], 0)
-            keep(total)
-
-        def narrow() raises {imm narrow_map, imm probes}:
-            var total = 0
-            for i in range(len(probes)):
-                total += narrow_map.get(probes[i], 0)
+                total += map.get(probes[i], 0)
             keep(total)
 
         def theirs() raises {imm theirs_map, imm probes}:
@@ -142,8 +134,7 @@ def bench_lookup() raises:
         print(
             "  ",
             pad(name, 12),
-            rpad(fmt(measure(wide) / count), 6),
-            rpad(fmt(measure(narrow) / count), 8),
+            rpad(fmt(measure(ours) / count), 8),
             rpad(fmt(measure(theirs) / count), 8),
         )
 
@@ -186,6 +177,13 @@ def report_footprint() raises:
 
 
 def main() raises:
+    print(
+        "KeyCountType =",
+        "uint16" if NARROW else "uint32",
+        " cached hash =",
+        size_of[Timed._HashCacheType](),
+        "bytes",
+    )
     print("cached hash width: uint32 index ->", size_of[Wide._HashCacheType]())
     print(
         "                   uint16 index ->", size_of[Narrow._HashCacheType]()

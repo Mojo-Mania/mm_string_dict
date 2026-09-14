@@ -59,7 +59,7 @@ hash, and nothing else.
 - You know the size up front. `StringDict[Int](capacity=n)` removes table
   growth entirely, and an insert then costs 10.0 ns against the stdlib's 10.5.
 - You have fewer than 65535 keys. `StringDict[Int, .uint16]` is 12% smaller
-  again for no measurable change in build time — see *Narrowing the index*.
+  again at no measurable cost in time — see *Narrowing the index*.
 
 **Look elsewhere when:**
 
@@ -216,9 +216,13 @@ means 16 cached bits rather than 32.
 
 That is 4–7 bytes an entry, and it takes the container to **51% of a `Dict`** —
 better than turning the hash cache off, while keeping the build speed the cache
-buys. Building is unchanged within noise; lookups are 3% slower, the cost of
-widening a 16-bit index on every probe. `pixi run bench-narrow` runs the
-comparison.
+buys. Builds and lookups are unchanged: a 16-bit load zero-extends in the same
+instruction as a 32-bit one, so the narrower index costs nothing to read.
+
+Measured one index width per process, twice each (`pixi run bench-narrow` and
+`bench-narrow-16`). Measuring both in one process gave contradictory answers run
+to run — 3% slower one time, 10–28% faster the next — and neither survived a
+second look. The footprint column needs no such care; it is counted, not timed.
 
 `size_of[String]` is 24 bytes, so a stdlib slot is 40 before any key data, and
 Mojo's inline string buffer runs out at 23 bytes — past that each key is a
@@ -352,7 +356,7 @@ everywhere, and this one is not.
 | `capacity=n` | 16 | Removes growth, which is the entire insert gap. |
 | `destructive` | `True` | `delete`/`pop`/`clear`, for one bit per entry and no measurable time. |
 | `caching_hashes` | `True` | A rehash reuses stored hash bits instead of recomputing: growth 11.4 → 9.1 ns, builds 1.3× → 1.15× the stdlib. Costs 4 bytes per entry, about 12% of a map. Turn it off for the smallest footprint. |
-| `KeyCountType` | `uint32` | Narrower shrinks the slot index *and* the cached hash: `uint16` is 12% smaller overall for ~3% slower lookups. `put` aborts if entries exceed what it can index. |
+| `KeyCountType` | `uint32` | Narrower shrinks the slot index *and* the cached hash: `uint16` is 12% smaller overall at no measurable cost in time. `put` aborts if entries exceed what it can index. |
 | `KeyOffsetType` | `uint32` | Caps the total size of all keys together. |
 
 ## Development
@@ -366,7 +370,8 @@ pixi build                      # the conda package (needs pixi >= 0.80)
 
 pixi run bench                  # the corpus tables above
 pixi run bench-small-maps       # one map per document
-pixi run bench-narrow           # KeyCountType uint16 against uint32
+pixi run bench-narrow           # KeyCountType uint32, alone
+pixi run bench-narrow-16        # KeyCountType uint16, alone
 pixi run bench-anatomy          # where an insert's time goes
 pixi run bench-destructive      # destructive=True, one variant per process
 pixi run bench-non-destructive  # destructive=False, likewise
