@@ -116,17 +116,29 @@ def bench_lookup(corpora: List[String]) raises:
             map.put(words[i], i)
             theirs_map[words[i]] = i
 
-        def ours() raises {imm map, imm words}:
+        # Probe with equal but independently allocated strings. Mojo's `String`
+        # is copy-on-write, so `theirs_map[words[i]] = i` stores a key sharing
+        # its buffer with `words[i]`, and probing with that same object lets
+        # `String.__eq__` answer on pointer identity without reading the bytes.
+        # That measures the copy-on-write rather than the map: on 500-byte keys
+        # it halves the stdlib's time. A `StringDict` copies keys into its
+        # packed buffer and can never take that path, so it is not a comparison
+        # between the two containers.
+        var probes = List[String](capacity=len(words))
+        for i in range(len(words)):
+            probes.append(String(words[i], ""))
+
+        def ours() raises {imm map, imm probes}:
             var total = 0
-            for i in range(len(words)):
-                total += map.get(words[i], 0)
+            for i in range(len(probes)):
+                total += map.get(probes[i], 0)
             keep(total)
 
-        def theirs() raises {imm theirs_map, imm words}:
+        def theirs() raises {imm theirs_map, imm probes}:
             var total = 0
-            for i in range(len(words)):
+            for i in range(len(probes)):
                 try:
-                    total += theirs_map[words[i]]
+                    total += theirs_map[probes[i]]
                 except:
                     pass
             keep(total)

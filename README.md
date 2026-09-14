@@ -60,8 +60,13 @@ offset, and nothing else.
 **Look elsewhere when:**
 
 - Your keys are not strings. This is string-keyed only, by construction.
-- Your keys are huge. At 400–560 bytes per key the memory advantage disappears
-  (98–135% of `Dict`) and present-key lookups run 1.5–2× slower.
+- Your keys are huge *and few*. At 400–560 bytes per key the memory advantage
+  disappears (98–135% of `Dict`), because the stdlib's 40-byte slot is noise
+  beside the key itself. Lookups stay level.
+- You re-probe with the same `String` objects you inserted. A `Dict` stores an
+  alias of your string (Mojo's `String` is copy-on-write) and compares on
+  pointer identity, which a packed buffer cannot match — worth 2× on very long
+  keys.
 - You churn heavily. A deleted entry's key bytes and value are held until the
   map is dropped, because entries are never renumbered, so a long-lived map
   under constant insert/delete grows in key storage even as the table does not.
@@ -200,27 +205,38 @@ Nanoseconds per lookup.
 | corpus | every word, present | | probe from another script | |
 | --- | --- | --- | --- | --- |
 | | StringDict | stdlib | StringDict | stdlib |
-| english | 7.3 | **7.1** | **2.6** | 2.8 |
-| german | **7.6** | 8.3 | **3.0** | 3.2 |
-| l33t | 7.5 | **7.2** | **2.3** | 2.5 |
-| french | 8.7 | **8.6** | **2.7** | 2.9 |
-| greek | 8.8 | 8.8 | **2.4** | 2.7 |
-| arabic | **9.5** | 9.9 | **2.4** | 2.6 |
-| hebrew | 9.6 | 9.6 | **2.3** | 2.5 |
-| hindi | 9.3 | **9.1** | **2.3** | 2.6 |
-| georgian | 8.5 | **8.3** | **2.3** | 2.5 |
-| s3_actions | 6.9 | **6.7** | **2.3** | 2.5 |
-| chinese | 39.2 | **25.1** | **2.3** | 2.6 |
-| japanese | 56.7 | **27.3** | **2.3** | 2.5 |
+| english | 6.7 | **6.4** | **2.6** | 2.8 |
+| german | 7.7 | 7.7 | **3.0** | 3.2 |
+| l33t | 7.7 | **7.6** | **2.3** | 2.5 |
+| french | **8.4** | 8.5 | **2.7** | 2.9 |
+| greek | **8.8** | 8.9 | **2.4** | 2.7 |
+| arabic | **9.5** | 9.6 | **2.4** | 2.6 |
+| hebrew | **9.2** | 9.6 | **2.3** | 2.5 |
+| hindi | **8.7** | 9.2 | **2.3** | 2.6 |
+| georgian | **8.5** | 8.7 | **2.3** | 2.5 |
+| s3_actions | **6.7** | 7.1 | **2.3** | 2.5 |
+| chinese | **38.8** | 50.7 | **2.3** | 2.6 |
+| japanese | 56.8 | **54.3** | **2.3** | 2.5 |
 
-Present-key lookups are level on every corpus of ordinary words, and misses are
-consistently a little faster — the 7-bit tag in the control byte rejects a wrong
-key without touching the key bytes at all.
+Level on every corpus, and misses are consistently a little faster — the 7-bit
+tag in the control byte rejects a wrong key without touching the key bytes at
+all. On the 464-byte Chinese keys the packed buffer pulls ahead by 24%.
 
-The CJK corpora are the exception, and the gap grows with key length. That is a
-real gap, not noise, and it is unexplained: both sides hash with the same builtin
-and bottom out in the same stdlib byte comparison. See
-[`docs/improvements.md`](docs/improvements.md).
+**A note on how these are measured, because it changes the answer.** Mojo's
+`String` is copy-on-write: `d[key] = v` on a `Dict[String, V]` stores a key that
+*shares its buffer* with the string you passed — verified, ten of ten stored keys
+aliasing the inserted object. Probe with that same object and `String.__eq__`
+answers on pointer identity without reading a byte. This benchmark used to do
+exactly that, and it made the stdlib look twice as fast on long keys: 27.6 ns
+against 52.3 for the same lookup with an equal but independently allocated
+probe. A `StringDict` copies keys into its packed buffer, so it can never take
+that path, and comparing the two that way measured the copy-on-write rather than
+the maps. The table above probes both with fresh strings.
+
+Which is the honest default: you usually look up a key you built or received,
+not the identical object you inserted. If your workload really does re-probe
+with the same `String` objects, a `Dict` has a genuine edge on long keys that a
+packed buffer cannot match.
 
 A miss with the table 85% full — the case that used to fall apart, walking 24
 slots on average before the control byte existed — costs **3.8 ns** against the
@@ -236,20 +252,29 @@ the constructor.
 | corpus | index every word | | count word frequencies | |
 | --- | --- | --- | --- | --- |
 | | StringDict | stdlib | StringDict | stdlib |
-| english | 12.9 | **10.0** | **10.6** | 17.8 |
-| german | 13.4 | **11.0** | **11.3** | 19.6 |
-| l33t | 9.4 | **7.9** | **8.4** | 11.1 |
-| french | 9.6 | **7.4** | **9.3** | 11.3 |
-| greek | 9.6 | **7.6** | **9.2** | 11.2 |
-| arabic | 9.3 | **7.8** | **9.2** | 11.3 |
-| hebrew | 8.1 | **7.2** | **7.9** | 10.6 |
-| hindi | 9.4 | **8.1** | **8.9** | 12.2 |
-| georgian | 8.9 | **7.5** | **8.5** | 10.6 |
+| english | 12.9 | **10.2** | **10.0** | 18.3 |
+| german | 13.1 | **11.0** | **10.8** | 20.3 |
+| l33t | 9.2 | **7.4** | **8.8** | 11.2 |
+| french | 9.9 | **7.4** | **9.5** | 11.3 |
+| greek | 10.1 | **7.7** | **9.0** | 11.0 |
+| arabic | 9.6 | **7.7** | **9.3** | 11.2 |
+| hebrew | 8.3 | **7.4** | **7.8** | 10.5 |
+| hindi | 9.5 | **7.9** | **8.8** | 12.2 |
+| georgian | 9.0 | **7.4** | **8.5** | 10.5 |
 | s3_actions | 4.7 | **3.9** | 4.7 | **5.3** |
+| chinese | 0.9 | **0.4** | 1.1 | **0.7** |
+| japanese | 1.0 | **0.5** | 1.3 | **0.8** |
 
-Indexing is about 1.3× the stdlib. Counting — the same work plus a read per word
-— is *faster* on ten of twelve corpora, because `upsert` settles a word in one
-probe where a `Dict` needs a read and then a write. On english that is 68%.
+Indexing is about 1.3× the stdlib, and part of that is inherent: a `StringDict`
+copies each key's bytes into its packed buffer, where a `Dict` stores a
+copy-on-write alias and copies nothing. That is the price of the density, and it
+shows most on the CJK rows, where the stdlib gets 500 bytes per key for free. It
+also means the source strings can be dropped once the map is built — a `Dict`
+keeps every one of their allocations alive.
+
+Counting — the same work plus a read per word — is *faster* on ten of twelve
+corpora, because `upsert` settles a word in one probe where a `Dict` needs a read
+and then a write. On english that is 83%.
 
 ### Many small maps
 

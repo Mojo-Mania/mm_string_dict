@@ -232,28 +232,43 @@ against 23.4/24.0 ns per insert). Restored, because "an empty slot's index is
 zero" is a real invariant that a future reader could reasonably lean on, and
 giving it up bought nothing.
 
-## 2. Long keys: a lookup gap that grows with key length
+## 2. Resolved: the long-key "gap" was the benchmark, not the map
 
-Present-key lookups are level with the stdlib `Dict` on every corpus of
-ordinary words, but not on the two CJK ones, whose "words" are whole paragraphs:
+Present-key lookups on the CJK corpora appeared to run 1.5-2x slower than the
+stdlib `Dict`, and the gap grew with key length. It is gone, and nothing in this
+container changed -- the benchmark was wrong.
 
-| corpus | avg key bytes | StringDict | stdlib |
-| --- | --- | --- | --- |
-| hindi | 18 | 8.7 ns | 9.0 ns |
-| chinese | 464 | 37.7 ns | 24.4 ns |
-| japanese | 499 | 48.6 ns | 27.3 ns |
+Mojo's `String` is copy-on-write. `d[key] = v` on a `Dict[String, V]` stores a
+key that **shares its buffer** with the string handed in: ten of ten stored keys
+aliased the inserted object when checked, and `String.copy()` returns a string
+with the same data pointer. So when the benchmark stored `words[i]` and then
+probed with that same `words[i]`, `String.__eq__` answered on pointer identity
+and never read the bytes. A `StringDict` copies keys into its packed buffer and
+can never do that, so the two sides were not doing the same work.
 
-The gap grows faster than the key length, which rules out a fixed per-lookup
-cost. It is unexplained. Both sides hash the whole key with the same builtin
-`hash`, and both bottom out in the same stdlib `StringSlice` comparison for the
-final byte-for-byte check; the only structural difference on the read path is
-that reconstructing a key here costs two dependent loads from the end-offset
-array before the comparison can start, and that should be a couple of
-nanoseconds, not twenty.
+Probing with an equal but independently allocated string, on the japanese
+corpus (499-byte keys):
 
-Worth profiling rather than guessing at. A cheap first check: measure a hit
-against a miss that shares the same tag, which separates comparison cost from
-hashing cost.
+| | probe is the inserted object | probe is a fresh copy |
+| --- | --- | --- |
+| stdlib `Dict` | 27.6 ns | 52.3 ns |
+| `StringDict` | 51.9 ns | 53.4 ns |
+
+The stdlib's advantage is entirely the short-circuit. With a fair probe the two
+are level, and on the 464-byte chinese keys the packed buffer is 24% *ahead*
+(38.8 ns against 50.7).
+
+How the arithmetic gave it away: hashing one 499-byte key costs 23.9 ns and
+comparing two costs about 12, so a real lookup cannot come in under ~36. The
+stdlib was measuring 27.4. That is what a missing comparison looks like, and it
+was worth chasing rather than filing as noise.
+
+Two things follow for the rest of this document. The benchmark now probes with
+fresh strings. And the same copy-on-write explains part of the *build* gap,
+which is not a benchmark artifact but a real design cost: a `Dict` stores an
+alias and copies no key bytes at all, while a packed buffer must copy every one.
+The compensation is that the source strings can then be dropped, where a `Dict`
+pins every one of their allocations.
 
 ## 3. Deleted entries still hold their key bytes and value
 
