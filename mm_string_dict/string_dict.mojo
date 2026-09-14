@@ -75,10 +75,10 @@ def _entry_block[
     packed key bytes are the exception and live in their own buffer: they grow
     when the bytes run out, which has nothing to do with the entry count.
 
-    Regions are laid out most-aligned first. Hashes are 8-byte and start at
-    zero, so they need nothing; the end offsets that follow are at a multiple
-    of 8; the values are then rounded up to their own alignment, which matters
-    when the offsets are narrower than the values.
+    Regions are laid out most-aligned first, and each start is rounded up to
+    what the region needs. The cached hashes keep only the low 32 bits of a
+    hash, which is all a rehash requires: the new slot is `hash & new_mask`,
+    and no table reaches 2^32 slots.
 
     Parameters:
         V: The value type.
@@ -95,7 +95,9 @@ def _entry_block[
     """
     var ends = 0
     comptime if caching_hashes:
-        ends = capacity * size_of[UInt64]()
+        ends = capacity * size_of[UInt32]()
+    comptime EALIGN = align_of[Scalar[KeyEndType]]()
+    ends = ((ends + EALIGN - 1) // EALIGN) * EALIGN
     var values = ends + capacity * size_of[Scalar[KeyEndType]]()
     comptime VALIGN = align_of[V]()
     values = ((values + VALIGN - 1) // VALIGN) * VALIGN
@@ -142,7 +144,7 @@ struct StringDict[
     KeyCountType: DType = .uint32,
     KeyOffsetType: DType = .uint32,
     destructive: Bool = True,
-    caching_hashes: Bool = False,
+    caching_hashes: Bool = True,
 ](Boolable, Copyable, Movable, Sized):
     """A hash map from string keys to `V`, with the keys packed end to end.
 
@@ -160,17 +162,24 @@ struct StringDict[
             caps the total size of all keys together.
         destructive: Whether `delete` is supported. It costs one bit per entry
             for the tombstone mask; with it off, `delete` does nothing.
-        caching_hashes: Whether to keep each key's full 64-bit hash, indexed
-            by entry. Growing the table then reuses the stored hash instead of
-            hashing every key again, which is where the cost of growth sits:
-            it takes growth from 12.3ns per insert to 10.9 and halves the gap
-            to the stdlib `Dict`, worth 4-7% on a corpus build. It does *not*
-            measurably change lookups, long keys included -- a lookup that
-            finds its key compares the key bytes anyway, and the control byte
-            already rejects 127 of every 128 wrong slots before that. The
-            price is 8 bytes per entry, which measured 19-34% of a whole map
-            on the corpora. Off by default, because footprint is what this
-            container is for; turn it on for insert-heavy maps that grow.
+        caching_hashes: Whether to keep the low 32 bits of each key's hash,
+            indexed by entry. On by default, and worth it for two reasons.
+
+            Growing the table reuses the stored bits instead of hashing every
+            key again, which is where the cost of growth sits: growth drops
+            from 11.4ns per insert to 8.9, under the stdlib `Dict`'s 9.4, and
+            an insert into a map growing from empty goes from 22.8ns to 19.0
+            against the stdlib's 20.1. Thirty-two bits are all a rehash needs
+            -- the new slot is `hash & new_mask`, and the new tag is copied
+            from the control byte the entry already had.
+
+            A lookup also compares those bits before the key bytes, past the
+            control byte's seven. That does not measurably change lookups, so
+            it is not the reason to keep this on.
+
+            The price is 4 bytes per entry, about 12% of a map. Turn it off
+            for the smallest possible footprint, at a build roughly 1.3x the
+            stdlib's instead of 1.15x.
     """
 
     var _key_buffer: Pointer[UInt8, MutUntrackedOrigin]
@@ -198,10 +207,15 @@ struct StringDict[
     outnumber slots."""
     var entry_capacity: Int
     """Entries the block has room for, shared by all three regions."""
-    var entry_hashes: Pointer[UInt64, MutUntrackedOrigin]
-    """Each key's full hash, indexed by entry rather than by slot, when
-    `caching_hashes` is on. Keyed by entry it survives a rehash, which is what
-    lets the rehash reuse it; keyed by slot it would not."""
+    var entry_hashes: Pointer[UInt32, MutUntrackedOrigin]
+    """The low 32 bits of each key's hash, indexed by entry rather than by
+    slot, when `caching_hashes` is on.
+
+    Keyed by entry it survives a rehash, which is what lets the rehash reuse
+    it; keyed by slot it would not. Thirty-two bits are enough: a rehash needs
+    the new slot, which is `hash & new_mask`, and the new tag, which it copies
+    from the old control byte rather than recomputing from the top of the
+    hash."""
     var _values: Pointer[Self.V, MutUntrackedOrigin]
     """The values, in insertion order, parallel to the keys."""
     var slot_to_index: Pointer[Scalar[Self.KeyCountType], MutUntrackedOrigin]
@@ -253,7 +267,7 @@ struct StringDict[
         )
         self.entries = Self._alloc_entries(self.entry_capacity)
         # Placeholders; `_bind_entries` sets all four from `entries`.
-        self.entry_hashes = self.entries.unsafe_bitcast[UInt64]()
+        self.entry_hashes = self.entries.unsafe_bitcast[UInt32]()
         self.keys_end = self.entries.unsafe_bitcast[
             Scalar[Self.KeyOffsetType]
         ]()
@@ -293,7 +307,7 @@ struct StringDict[
         ).unsafe_bitcast[UInt8]()
         self.entry_capacity = copy.entry_capacity
         self.entries = Self._alloc_entries(self.entry_capacity)
-        self.entry_hashes = self.entries.unsafe_bitcast[UInt64]()
+        self.entry_hashes = self.entries.unsafe_bitcast[UInt32]()
         self.keys_end = self.entries.unsafe_bitcast[
             Scalar[Self.KeyOffsetType]
         ]()
@@ -407,7 +421,7 @@ struct StringDict[
         var block = _entry_block[
             Self.V, Self.KeyOffsetType, Self.caching_hashes, Self.destructive
         ](self.entry_capacity)
-        self.entry_hashes = self.entries.unsafe_bitcast[UInt64]()
+        self.entry_hashes = self.entries.unsafe_bitcast[UInt32]()
         self.keys_end = self.entries.unsafe_offset(block[0]).unsafe_bitcast[
             Scalar[Self.KeyOffsetType]
         ]()
@@ -523,7 +537,7 @@ struct StringDict[
         unsafe_destroy_n(self._values, self.entry_count)
         dealloc(
             Allocation(
-                unsafe_owned_ptr=self.entries.unsafe_bitcast[UInt64](),
+                unsafe_owned_ptr=self.entries.unsafe_bitcast[UInt32](),
                 layout={count = Self._entry_words(self.entry_capacity)},
             )
         )
@@ -861,7 +875,7 @@ struct StringDict[
         self._append_key(key, index, ends)
         values.unsafe_offset(index).unsafe_write(value.copy())
         comptime if Self.caching_hashes:
-            self.entry_hashes.unsafe_store(index, key_hash)
+            self.entry_hashes.unsafe_store(index, UInt32(key_hash))
         self.entry_count += 1
         self.count += 1
         if self.control[unsafe_offset=reusable] == _EMPTY:
@@ -900,17 +914,32 @@ struct StringDict[
     ) -> Bool:
         """Whether the entry at `slot` really is `key`, past the tag match."""
         comptime if Self.caching_hashes:
-            if self.entry_hashes[unsafe_offset=key_index - 1] != key_hash:
+            if self.entry_hashes[unsafe_offset=key_index - 1] != UInt32(
+                key_hash
+            ):
                 return False
         return self._key_at(key_index - 1) == key
 
     @always_inline
     def _occupy(mut self, slot: Int, key_hash: UInt64, key_index: Int):
-        """Writes an entry into a slot, control byte and mirror included."""
+        """Writes an entry into a slot, deriving its tag from `key_hash`."""
+        self._place(slot, Self._tag(key_hash), key_index)
+
+    @always_inline
+    def _place(mut self, slot: Int, tag: UInt8, key_index: Int):
+        """Writes an entry into a slot, control byte and mirror included.
+
+        Takes the tag rather than the hash, so a rehash can carry over the byte
+        an entry already had instead of recomputing it.
+
+        Args:
+            slot: The slot to fill.
+            tag: The seven hash bits that go in the control byte.
+            key_index: The one-based entry index.
+        """
         self.slot_to_index.unsafe_store(
             slot, Scalar[Self.KeyCountType](key_index)
         )
-        var tag = Self._tag(key_hash)
         self.control[unsafe_offset=slot] = tag
         if slot < GROUP:
             self.control[unsafe_offset=self.capacity + slot] = tag
@@ -1064,12 +1093,21 @@ struct StringDict[
             # The whole point of caching by entry: a rehash moves every live
             # entry, and hashing each key again is the single largest part of
             # what growth costs.
-            var key_hash: UInt64
+            var tag: UInt8
+            var slot: Int
             comptime if Self.caching_hashes:
-                key_hash = self.entry_hashes[unsafe_offset=key_index - 1]
+                # The entry already carries its tag in the byte it occupied,
+                # so the top of the hash is never needed here -- which is why
+                # the cached low 32 bits suffice.
+                tag = old_control[unsafe_offset=i]
+                slot = Int(
+                    self.entry_hashes[unsafe_offset=key_index - 1]
+                    & UInt32(mask)
+                )
             else:
-                key_hash = hash(self._key_at(key_index - 1))
-            var slot = Int(key_hash & UInt64(mask))
+                var key_hash = hash(self._key_at(key_index - 1))
+                tag = Self._tag(key_hash)
+                slot = Int(key_hash & UInt64(mask))
             var control = self.control
             while True:
                 var group = control.unsafe_offset(slot).unsafe_load[
@@ -1079,7 +1117,7 @@ struct StringDict[
                     group.eq(SIMD[DType.uint8, GROUP](_EMPTY))
                 )
                 if lane != GROUP:
-                    self._occupy((slot + lane) & mask, key_hash, key_index)
+                    self._place((slot + lane) & mask, tag, key_index)
                     self.occupied += 1
                     break
                 slot = (slot + GROUP) & mask

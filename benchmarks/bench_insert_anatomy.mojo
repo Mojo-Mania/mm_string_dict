@@ -18,7 +18,7 @@ from std.benchmark import Unit, keep, run
 from std.sys import get_defined_bool
 
 comptime ALPHABET: StaticString = "abcdefghijklmnopqrstuvwxyz0123456789"
-comptime CACHING = get_defined_bool["CACHING", False]()
+comptime CACHING = get_defined_bool["CACHING", True]()
 comptime Map = StringDict[Int, .uint32, .uint32, True, CACHING]
 
 

@@ -21,7 +21,7 @@ from mm_string_dict import StringDict
 from std.benchmark import Unit, keep, run
 from std.sys import get_defined_bool
 
-comptime CACHING = get_defined_bool["CACHING", False]()
+comptime CACHING = get_defined_bool["CACHING", True]()
 comptime Map = StringDict[Int, .uint32, .uint32, True, CACHING]
 
 

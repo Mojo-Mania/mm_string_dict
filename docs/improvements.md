@@ -3,71 +3,78 @@
 Open items, most worthwhile first. Numbers are release builds
 (`-D ASSERT=none`).
 
-## 1. Inserts are ~1.4x behind the stdlib `Dict`
+## 1. Resolved: the build gap was table growth, and growth was re-hashing
 
-Indexing the english corpus takes 14.5 us against the stdlib's 9.9. Taking an
-insert apart (`pixi run bench-anatomy`) says where that goes, and it is not
-where "inserts are slower" suggests:
+Indexing a corpus used to take about 1.3x what the stdlib `Dict` took. Taking an
+insert apart (`pixi run bench-anatomy`) put the whole of it in one place:
 
-| | StringDict | stdlib |
-| --- | --- | --- |
-| construct + destruct an empty map | 269.6 ns | 0.2 ns |
-| put, steady state, no growth or new keys | 10.8 ns | 11.8 ns |
-| insert, 4000 distinct keys, pre-sized | 10.8 ns | 10.4 ns |
-| insert, 4000 distinct keys, growing from empty | 23.0 ns | 19.4 ns |
-| so growth costs | 12.3 ns | 9.0 ns |
-
-Three separate findings:
-
-1. **Steady state is already even**, and slightly ahead. The probe and its
-   writes are not the problem.
-2. **Pre-sized, the gap is 4%.** Give the map its capacity up front and there
-   is essentially nothing in it.
-3. **Growth is more than half of an insert** for both implementations, and
-   ours costs 3.3 ns more per insert than theirs. That is the whole gap.
-
-Inside growth, `_rehash` recomputes `hash()` for every entry it moves, because
-neither the 7-bit control byte nor the slot a key sat in can rebuild a tag for
-the doubled table. Doubling moves about two entries per insert amortized, and
-one hash of a 10-byte key is 1.2 ns. Turning on `caching_hashes` removes that
-work and recovers 1.4 of the 3.3 ns -- see below; the rest of the gap is still
-open.
-
-### Done: `_rehash` reuses hashes, behind `caching_hashes`
-
-`caching_hashes` used to store a hash narrowed to `KeyCountType`, per *slot*,
-which was useless to a rehash on both counts -- narrowed it cannot rebuild a
-tag, and keyed by slot it does not survive the rehash that invalidates every
-slot. It now stores the full 64-bit hash per *entry*, and `_rehash` reuses it:
-
-| | caching off | caching on | stdlib |
+| | before | now | stdlib |
 | --- | --- | --- | --- |
-| insert, growing from empty | 23.2 ns | 21.9 ns | 19.3 ns |
-| of which growth | 12.3 ns | 10.9 ns | 9.1 ns |
-| corpus build (english) | 15.3 us | 14.9 us | 10.2 us |
-| corpus build (l33t) | 10.7 us | 9.9 us | 7.3 us |
+| put, steady state | 10.5 ns | **10.3 ns** | 12.3 ns |
+| insert, 4000 keys, pre-sized | 11.4 ns | **10.0 ns** | 10.5 ns |
+| insert, 4000 keys, growing from empty | 22.9 ns | **19.1 ns** | 19.4 ns |
+| of which growth | 11.6 ns | **9.1 ns** | 8.9 ns |
 
-Growth is 11% cheaper and the gap to the stdlib on growth halves, 3.1 ns to
-1.5. Corpus builds gain 4-7%.
+Steady state was already ahead and pre-sized was level, so neither the probe nor
+its writes was the problem. Growth was: more than half of an insert for both
+containers, and 2.7 ns per insert worse here. Inside it, `_rehash` recomputed
+`hash()` for every entry it moved, where the stdlib reuses the hash it stores.
 
-Two things it did **not** do, both worth recording because the first was
-predicted and wrong:
+### The fix, and why it is affordable
 
-- **The saving is 1.4 ns per insert, not the 2.4 predicted** from two hashes at
-  1.2 ns each. Doubling moves about two entries per insert amortized, so the
-  arithmetic was right about how many hashes are skipped; skipping them just
-  frees less than their standalone cost, the loop around them having plenty
-  else to wait on.
-- **Lookups are unchanged, long keys included.** The stored hash also acts as a
-  filter in `_matches` before the key comparison, and that was expected to pay
-  on the CJK corpora, where a comparison runs to 500 bytes. It does not: a
-  lookup that finds its key compares the bytes regardless, and the control
-  byte already rejects 127 of every 128 wrong slots, so the filter almost never
-  fires.
+A rehash does not need a whole hash. It needs the new slot, which is
+`hash & new_mask` and so depends only on low bits, and the new tag, which it can
+copy from the control byte the entry already had rather than recomputing it from
+the top of the hash. So `caching_hashes` stores the low **32 bits** per entry,
+not 64 -- half the memory of the first version, and slightly faster besides, for
+the smaller array and the skipped tag computation.
 
-It stays off by default. 8 bytes per entry measured 19-34% of a whole map on
-the corpora, and a 4-7% build gain does not buy that in a container chosen for
-footprint. It is the right switch for an insert-heavy map that grows.
+It is now the default. Growth fell to 9.1 ns against the stdlib's 8.9, an insert
+while growing to 19.1 against 19.4, corpus builds from ~1.3x to ~1.15x with
+hebrew crossing over to a win, and whole-corpus word counting now wins on eleven
+of twelve. It costs 4 bytes per entry, about 12% of a map: 59% of a `Dict`'s
+footprint rather than 52%. `caching_hashes=False` gets the 52% back, and the
+1.3x build with it.
+
+The first version of this stored the full 64-bit hash and was worth only 1.4 ns
+per insert, against a predicted 2.4. Narrowing it to 32 bits and taking the tag
+from the old control byte is worth 2.3 -- more saving for half the memory,
+because the extra work was never in the hashing alone.
+
+### What is left, which is not growth
+
+Corpus builds remain ~1.15x, and part of that is structural: a `StringDict`
+copies each key's bytes into its packed buffer, while a `Dict` stores a
+copy-on-write alias and copies nothing at all. That is the price of the density,
+and it shows on the CJK rows where the stdlib gets 500 bytes per key for free.
+The compensation is that the source strings can then be dropped, where a `Dict`
+pins every one of their allocations.
+
+The constructor is also still behind -- 38.5 ns against a `Dict`'s 0.3, which
+allocates nothing until its first insert. The allocation work below covers why
+deferral is the wrong answer here and a cheaper constructor was the right one.
+
+### Fixed on the way: the tombstone mask check cost 19% of an insert
+
+`destructive=True` is the default, and it used to make inserts 19% slower than
+`destructive=False` (25.2 ns against 20.3 at 28000 keys). The bit itself was
+never the problem. `_reserve_deleted_bit` was `@no_inline` and did its bounds
+check *inside* the function, so every insert paid for a call to learn that the
+mask was already big enough. Hoisting the check into the caller and leaving only
+the reallocation behind `@no_inline` took the insert to 19.7 ns, level with the
+non-destructive variant. Deletion support now costs one bit per entry and no
+measurable time.
+
+### Killed by measurement: splitting the growth path out of `KeysContainer.add`
+
+The key-byte buffer grows inside `_append_key`, whose body is a few instructions
+around a `memcpy`. In `mm_lcrs_tree` exactly that shape cost 20%, and splitting
+the cold path into an `@no_inline` helper took a node from 5.8 ns to 3.4.
+
+The same split here is consistently **2-3% slower**. The difference is where the
+cheap check already sat: in `_reserve_deleted_bit` the hot path was a function
+call; here it was already inline, so the split only added a call and register
+spills at the growth site. Reverted.
 
 ### Done, partly: fewer allocations, the way the trees do it
 
