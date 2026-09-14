@@ -52,8 +52,8 @@ hash, and nothing else.
 - You hold a lot of string keys and the footprint matters — a symbol table, an
   inverted index, a vocabulary, a lookup table read far more often than written.
 - You build many small maps: one per document, per request, per group. That is
-  where it wins outright, **519 ns per 20-word document against the stdlib's
-  813**, and it wins at every size measured.
+  where it wins outright, **573 ns per 20-word document against the stdlib's
+  851**, and it wins at every size measured.
 - Your workload is read-mostly, or counts things. Lookups are level with the
   stdlib and `upsert` beats it on ten of twelve corpora, english by 68%.
 - You know the size up front. `StringDict[Int](capacity=n)` removes table
