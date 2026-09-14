@@ -66,7 +66,11 @@ comptime _MIN_KEYS = 8
 
 @always_inline
 def _entry_block[
-    V: AnyType, KeyEndType: DType, caching_hashes: Bool, destructive: Bool
+    V: AnyType,
+    KeyEndType: DType,
+    HashCacheType: DType,
+    caching_hashes: Bool,
+    destructive: Bool,
 ](capacity: Int) -> Tuple[Int, Int, Int, Int]:
     """Byte offsets of each entry region, and the block's total size.
 
@@ -83,6 +87,7 @@ def _entry_block[
     Parameters:
         V: The value type.
         KeyEndType: The type of a key end offset.
+        HashCacheType: The type of a cached hash.
         caching_hashes: Whether a hash region is present.
         destructive: Whether a tombstone mask is present.
 
@@ -95,7 +100,7 @@ def _entry_block[
     """
     var ends = 0
     comptime if caching_hashes:
-        ends = capacity * size_of[UInt32]()
+        ends = capacity * size_of[Scalar[HashCacheType]]()
     comptime EALIGN = align_of[Scalar[KeyEndType]]()
     ends = ((ends + EALIGN - 1) // EALIGN) * EALIGN
     var values = ends + capacity * size_of[Scalar[KeyEndType]]()
@@ -182,6 +187,20 @@ struct StringDict[
             stdlib's instead of 1.15x.
     """
 
+    comptime _HashCacheType = (
+        DType.uint16 if (
+            Self.KeyCountType == .uint8 or Self.KeyCountType == .uint16
+        ) else DType.uint32
+    )
+    """How much of a hash to cache, derived from how many entries can exist.
+
+    A rehash uses the cached bits as `hash & new_mask`, so it needs as many
+    bits as the new capacity has. A `uint16` entry index caps the map at 65535
+    entries, and a table for those never needs more than 17 bits of mask -- so
+    16 bits cover every capacity up to 65536, and `_rehash` falls back to
+    hashing for the single doubling past that. Halving this array is worth 2
+    bytes an entry on top of the 2 the narrower slot index already saves."""
+
     var _key_buffer: Pointer[UInt8, MutUntrackedOrigin]
     """Every key's bytes, one after another with no separator and no per-key
     header. This is the one buffer that does not grow with the entry count: it
@@ -207,7 +226,7 @@ struct StringDict[
     outnumber slots."""
     var entry_capacity: Int
     """Entries the block has room for, shared by all three regions."""
-    var entry_hashes: Pointer[UInt32, MutUntrackedOrigin]
+    var entry_hashes: Pointer[Scalar[Self._HashCacheType], MutUntrackedOrigin]
     """The low 32 bits of each key's hash, indexed by entry rather than by
     slot, when `caching_hashes` is on.
 
@@ -267,7 +286,9 @@ struct StringDict[
         )
         self.entries = Self._alloc_entries(self.entry_capacity)
         # Placeholders; `_bind_entries` sets all four from `entries`.
-        self.entry_hashes = self.entries.unsafe_bitcast[UInt32]()
+        self.entry_hashes = self.entries.unsafe_bitcast[
+            Scalar[Self._HashCacheType]
+        ]()
         self.keys_end = self.entries.unsafe_bitcast[
             Scalar[Self.KeyOffsetType]
         ]()
@@ -307,7 +328,9 @@ struct StringDict[
         ).unsafe_bitcast[UInt8]()
         self.entry_capacity = copy.entry_capacity
         self.entries = Self._alloc_entries(self.entry_capacity)
-        self.entry_hashes = self.entries.unsafe_bitcast[UInt32]()
+        self.entry_hashes = self.entries.unsafe_bitcast[
+            Scalar[Self._HashCacheType]
+        ]()
         self.keys_end = self.entries.unsafe_bitcast[
             Scalar[Self.KeyOffsetType]
         ]()
@@ -387,7 +410,11 @@ struct StringDict[
             " entry block is a word array"
         )
         var block = _entry_block[
-            Self.V, Self.KeyOffsetType, Self.caching_hashes, Self.destructive
+            Self.V,
+            Self.KeyOffsetType,
+            Self._HashCacheType,
+            Self.caching_hashes,
+            Self.destructive,
         ](capacity)
         return (block[3] + 7) >> 3
 
@@ -419,9 +446,15 @@ struct StringDict[
         another, and would reload the offsets on every use.
         """
         var block = _entry_block[
-            Self.V, Self.KeyOffsetType, Self.caching_hashes, Self.destructive
+            Self.V,
+            Self.KeyOffsetType,
+            Self._HashCacheType,
+            Self.caching_hashes,
+            Self.destructive,
         ](self.entry_capacity)
-        self.entry_hashes = self.entries.unsafe_bitcast[UInt32]()
+        self.entry_hashes = self.entries.unsafe_bitcast[
+            Scalar[Self._HashCacheType]
+        ]()
         self.keys_end = self.entries.unsafe_offset(block[0]).unsafe_bitcast[
             Scalar[Self.KeyOffsetType]
         ]()
@@ -537,7 +570,9 @@ struct StringDict[
         unsafe_destroy_n(self._values, self.entry_count)
         dealloc(
             Allocation(
-                unsafe_owned_ptr=self.entries.unsafe_bitcast[UInt32](),
+                unsafe_owned_ptr=self.entries.unsafe_bitcast[
+                    Scalar[Self._HashCacheType]
+                ](),
                 layout={count = Self._entry_words(self.entry_capacity)},
             )
         )
@@ -875,7 +910,9 @@ struct StringDict[
         self._append_key(key, index, ends)
         values.unsafe_offset(index).unsafe_write(value.copy())
         comptime if Self.caching_hashes:
-            self.entry_hashes.unsafe_store(index, UInt32(key_hash))
+            self.entry_hashes.unsafe_store(
+                index, Scalar[Self._HashCacheType](key_hash)
+            )
         self.entry_count += 1
         self.count += 1
         if self.control[unsafe_offset=reusable] == _EMPTY:
@@ -914,9 +951,9 @@ struct StringDict[
     ) -> Bool:
         """Whether the entry at `slot` really is `key`, past the tag match."""
         comptime if Self.caching_hashes:
-            if self.entry_hashes[unsafe_offset=key_index - 1] != UInt32(
-                key_hash
-            ):
+            if self.entry_hashes[unsafe_offset=key_index - 1] != Scalar[
+                Self._HashCacheType
+            ](key_hash):
                 return False
         return self._key_at(key_index - 1) == key
 
@@ -1095,15 +1132,25 @@ struct StringDict[
             # what growth costs.
             var tag: UInt8
             var slot: Int
+            comptime CACHED_SLOTS = 1 << (
+                size_of[Scalar[Self._HashCacheType]]() * 8
+            )
             comptime if Self.caching_hashes:
-                # The entry already carries its tag in the byte it occupied,
-                # so the top of the hash is never needed here -- which is why
-                # the cached low 32 bits suffice.
-                tag = old_control[unsafe_offset=i]
-                slot = Int(
-                    self.entry_hashes[unsafe_offset=key_index - 1]
-                    & UInt32(mask)
-                )
+                if self.capacity <= CACHED_SLOTS:
+                    # The entry already carries its tag in the byte it
+                    # occupied, so the top of the hash is never needed here --
+                    # which is why the cached low bits suffice.
+                    tag = old_control[unsafe_offset=i]
+                    slot = Int(
+                        self.entry_hashes[unsafe_offset=key_index - 1]
+                        & Scalar[Self._HashCacheType](mask)
+                    )
+                else:
+                    # One doubling past what the cached bits can address; only
+                    # reachable with a narrow `KeyCountType`.
+                    var key_hash = hash(self._key_at(key_index - 1))
+                    tag = Self._tag(key_hash)
+                    slot = Int(key_hash & UInt64(mask))
             else:
                 var key_hash = hash(self._key_at(key_index - 1))
                 tag = Self._tag(key_hash)

@@ -854,5 +854,28 @@ def test_owning_values_survive_growth_copy_and_clear() raises:
     assert_equal(dict.get("after", ""), "clear")
 
 
+def test_narrow_index_rehashes_past_its_cached_bits() raises:
+    """A `uint16` map grown past what 16 cached hash bits can address.
+
+    The cached hash is narrowed to `KeyCountType`: 16 bits for a `uint16`
+    index, which covers every table capacity up to 65536. A `uint16` map can
+    hold 65535 entries, and at 7/8 load that needs 131072 slots -- one doubling
+    further, where `hash & mask` no longer fits in the cached bits and
+    `_rehash` has to hash the keys again. Nothing else reaches that branch, and
+    getting it wrong puts entries in slots no probe visits.
+    """
+    comptime N = 60_000  # past 65536 * 7/8, so the last rehash takes the
+    # fallback
+    var dict = StringDict[Int, DType.uint16]()
+    for i in range(N):
+        dict[String("k", i)] = i
+
+    assert_equal(len(dict), N)
+    assert_true(dict.capacity > 65536, "the map did not grow past the cap")
+    for i in range(0, N, 7):
+        assert_equal(dict.get(String("k", i), -1), i, String("at ", i))
+    assert_false("k60000" in dict)
+
+
 def main() raises:
     TestSuite.discover_tests[__functions_in_module()]().run()

@@ -39,8 +39,9 @@ other is mostly mechanical.
 ## When to use it
 
 **It roughly halves the memory.** Across twelve real word lists a `StringDict`
-takes **59% of what `Dict[String, Int]` takes** by default, or **52%** with
-`caching_hashes=False` — 24–36 bytes of overhead per entry against 48–90. A
+takes **59% of what `Dict[String, Int]` takes** with the defaults, and **51%**
+as `StringDict[Int, .uint16]` if the map will hold fewer than 65535 keys — which
+costs nothing in speed, so prefer it when you can. A
 stdlib slot is 40 bytes before any key data (an 8-byte hash, a 24-byte `String`,
 an 8-byte value), and a key longer than 23 bytes gets a heap allocation of its
 own on top. Here a key costs its bytes, four bytes of end offset, four of cached
@@ -57,6 +58,8 @@ hash, and nothing else.
   stdlib and `upsert` beats it on ten of twelve corpora, english by 68%.
 - You know the size up front. `StringDict[Int](capacity=n)` removes table
   growth entirely, and an insert then costs 10.0 ns against the stdlib's 10.5.
+- You have fewer than 65535 keys. `StringDict[Int, .uint16]` is 12% smaller
+  again for no measurable change in build time — see *Narrowing the index*.
 
 **Look elsewhere when:**
 
@@ -185,9 +188,37 @@ every allocation each container makes.
 | japanese | 10 | 4992 | 7832 | 7768 | **5728** | 136% |
 | **all twelve** | | | **125212** | 111452 | 212844 | **59%** |
 
-The "no cache" column is `caching_hashes=False`, which drops the 4-byte cached
-hash per entry and lands at 52% of the stdlib, in exchange for a build about
-1.3× rather than 1.15×.
+The "no cache" column is `caching_hashes=False`, which drops the cached hash per
+entry and lands at 52% of the stdlib, in exchange for a build about 1.3× rather
+than 1.15×.
+
+#### Narrowing the index
+
+`KeyCountType` caps how many entries a map can hold and sizes the slot index to
+match. At `uint16` — 65535 entries, which most dictionaries never approach — two
+arrays shrink at once, because the cached hash is sized from the same parameter:
+a rehash needs only as many hash bits as the capacity has, so a 16-bit index
+means 16 cached bits rather than 32.
+
+| corpus | keys | uint32 | uint16 | saved |
+| --- | --- | --- | --- | --- |
+| english | 192 | 6003 | **5091** | 15% |
+| french | 418 | 13192 | **11264** | 14% |
+| german | 208 | 7627 | **6515** | 14% |
+| l33t | 339 | 12085 | **10157** | 15% |
+| greek | 320 | 14853 | **12925** | 12% |
+| arabic | 336 | 14853 | **12925** | 12% |
+| hebrew | 231 | 10752 | **9128** | 15% |
+| hindi | 250 | 12413 | **10789** | 13% |
+| georgian | 250 | 12413 | **10789** | 13% |
+| s3_actions | 143 | 7848 | **6936** | 11% |
+| **all twelve** | | 125212 | **109564** | **12%** |
+
+That is 4–7 bytes an entry, and it takes the container to **51% of a `Dict`** —
+better than turning the hash cache off, while keeping the build speed the cache
+buys. Building is unchanged within noise; lookups are 3% slower, the cost of
+widening a 16-bit index on every probe. `pixi run bench-narrow` runs the
+comparison.
 
 `size_of[String]` is 24 bytes, so a stdlib slot is 40 before any key data, and
 Mojo's inline string buffer runs out at 23 bytes — past that each key is a
@@ -321,13 +352,13 @@ everywhere, and this one is not.
 | `capacity=n` | 16 | Removes growth, which is the entire insert gap. |
 | `destructive` | `True` | `delete`/`pop`/`clear`, for one bit per entry and no measurable time. |
 | `caching_hashes` | `True` | A rehash reuses stored hash bits instead of recomputing: growth 11.4 → 9.1 ns, builds 1.3× → 1.15× the stdlib. Costs 4 bytes per entry, about 12% of a map. Turn it off for the smallest footprint. |
-| `KeyCountType` | `uint32` | Narrower shrinks the slot table; `put` aborts if entries exceed what it can index. |
+| `KeyCountType` | `uint32` | Narrower shrinks the slot index *and* the cached hash: `uint16` is 12% smaller overall for ~3% slower lookups. `put` aborts if entries exceed what it can index. |
 | `KeyOffsetType` | `uint32` | Caps the total size of all keys together. |
 
 ## Development
 
 ```bash
-pixi run test                   # the test suite (54 tests)
+pixi run test                   # the test suite (55 tests)
 pixi run main                   # the example
 pixi run format                 # mojo format
 pixi run docs                   # docstring check
@@ -335,6 +366,7 @@ pixi build                      # the conda package (needs pixi >= 0.80)
 
 pixi run bench                  # the corpus tables above
 pixi run bench-small-maps       # one map per document
+pixi run bench-narrow           # KeyCountType uint16 against uint32
 pixi run bench-anatomy          # where an insert's time goes
 pixi run bench-destructive      # destructive=True, one variant per process
 pixi run bench-non-destructive  # destructive=False, likewise

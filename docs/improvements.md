@@ -36,6 +36,19 @@ of twelve. It costs 4 bytes per entry, about 12% of a map: 59% of a `Dict`'s
 footprint rather than 52%. `caching_hashes=False` gets the 52% back, and the
 1.3x build with it.
 
+**And the width follows `KeyCountType`,** because the two are the same question.
+A rehash needs as many hash bits as the capacity has, and `KeyCountType` is what
+caps the capacity: a `uint16` index allows 65535 entries, whose table never
+exceeds 2^17 slots. So a `uint16` map caches 16 bits, not 32, and `_rehash`
+falls back to hashing only for the single doubling past 65536 slots -- a branch
+reachable between 57344 and 65535 entries, and tested there.
+
+`StringDict[V, .uint16]` is therefore 12% smaller than the default across the
+corpora, 4-7 bytes an entry, for no measurable change in build time and about 3%
+on lookups. At **51% of a `Dict`** it beats turning the cache off while keeping
+the build speed the cache buys, and it is the right default for any dictionary
+that will not reach 65535 keys.
+
 The first version of this stored the full 64-bit hash and was worth only 1.4 ns
 per insert, against a predicted 2.4. Narrowing it to 32 bits and taking the tag
 from the old control byte is worth 2.3 -- more saving for half the memory,
